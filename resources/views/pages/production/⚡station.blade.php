@@ -14,9 +14,13 @@ use App\Domain\Pallets\Exceptions\PalletRuleViolation;
 use App\Domain\Shared\Origin;
 use App\Domain\Shared\TraceContext;
 use App\Enums\Permission;
+use App\Domain\Operations\Heartbeat;
+use App\Domain\Shared\TraceEventType;
+use App\Models\Device;
 use App\Models\Pallet;
 use App\Models\PalletStandard;
 use App\Models\PalletScanEvent;
+use App\Models\TraceEvent;
 use App\Support\Correlation\CorrelationId;
 use Flux\Flux;
 use Illuminate\Database\Eloquent\Collection;
@@ -57,7 +61,7 @@ new #[Title('Producción')] class extends Component {
     /**
      * Last box read by hand: what the label said and where the box went.
      *
-     * @var array{order: string, item: string, description: string, lot: string, box: string, expiration: string, pallet: ?string, boxes: ?int, standard: ?int, closed: bool, test_standard: bool}|null
+     * @var array{at: string, order: string, item: string, description: string, lot: string, box: string, expiration: string, pallet: ?string, boxes: ?int, standard: ?int, closed: bool, test_standard: bool}|null
      */
     #[Locked]
     public ?array $lastBox = null;
@@ -114,6 +118,63 @@ new #[Title('Producción')] class extends Component {
             ->get();
     }
 
+    /**
+     * What the fixed readers on the line did lately (boxes:reader): the last
+     * read, counted or not, the boxes not counted in the last hour and each
+     * reader's connection. Null when there is no fixed reader.
+     *
+     * @return array{last: ?array{ok: bool, at: \Carbon\CarbonInterface, reader: string, box: ?string, pallet: ?string, boxes: ?int, standard: ?int, order: ?string, lot: ?string, reason: ?string, read: ?string}, not_counted: int, counted: int, errors: list<array{at: \Carbon\CarbonInterface, reader: string, reason: string, read: ?string}>, readers: list<array{code: string, name: string, connected: ?bool}>}|null
+     */
+    #[Computed]
+    public function lineReads(): ?array
+    {
+        $readers = Device::query()->where('kind', 'LECTOR')->where('active', true)->where('code', '!=', RegisterManualBoxScan::DEVICE_CODE)->orderBy('code')->get(['id', 'code', 'name']);
+        if ($readers->isEmpty()) {
+            return null;
+        }
+        $codes = $readers->pluck('code', 'id');
+        $since = now()->subHour();
+
+        $counted = PalletScanEvent::query()->with('pallet:id,pallet_code,boxes_count,standard_boxes_snapshot')
+            ->where('processing_status', ScanEventStatus::Accepted)->whereNotNull('read_by_device_id')
+            ->latest('received_at')->first();
+        $errorQuery = fn () => TraceEvent::query()->where('event', TraceEventType::ScanRejected->value)->where('subject_type', 'device')
+            ->whereIn('subject_id', $readers->pluck('id'))->where('occurred_at', '>=', $since);
+        $errors = $errorQuery()->latest('occurred_at')->limit(5)->get(['subject_id', 'occurred_at', 'reason', 'context']);
+
+        $error = $errors->first();
+        $last = null;
+        if ($counted !== null && ($error === null || $counted->received_at->greaterThanOrEqualTo($error->occurred_at))) {
+            $last = [
+                'ok' => true, 'at' => $counted->received_at, 'reader' => (string) ($codes[$counted->read_by_device_id] ?? ''),
+                'box' => $counted->external_event_id, 'pallet' => $counted->pallet?->pallet_code,
+                'boxes' => $counted->pallet?->boxes_count, 'standard' => $counted->pallet?->standard_boxes_snapshot,
+                'order' => $counted->production_order_ref, 'lot' => $counted->lot_code, 'reason' => null, 'read' => null,
+            ];
+        } elseif ($error !== null) {
+            $last = [
+                'ok' => false, 'at' => $error->occurred_at, 'reader' => (string) ($codes[$error->subject_id] ?? ''),
+                'box' => null, 'pallet' => null, 'boxes' => null, 'standard' => null, 'order' => null, 'lot' => null,
+                'reason' => (string) $error->reason, 'read' => isset($error->context['read']) ? (string) $error->context['read'] : null,
+            ];
+        }
+
+        return [
+            'last' => $last,
+            'not_counted' => $errorQuery()->count(),
+            'counted' => PalletScanEvent::query()->where('processing_status', ScanEventStatus::Accepted)->whereNotNull('read_by_device_id')->where('received_at', '>=', $since)->count(),
+            'errors' => $errors->map(fn (TraceEvent $e) => [
+                'at' => $e->occurred_at, 'reader' => (string) ($codes[$e->subject_id] ?? ''), 'reason' => (string) $e->reason,
+                'read' => isset($e->context['read']) ? (string) $e->context['read'] : null,
+            ])->values()->all(),
+            // Null: never connected (maybe not installed yet).
+            'readers' => $readers->map(fn (Device $d) => [
+                'code' => $d->code, 'name' => $d->name,
+                'connected' => Heartbeat::last(Heartbeat::reader($d->code)) === null ? null : Heartbeat::isFresh(Heartbeat::reader($d->code)),
+            ])->values()->all(),
+        ];
+    }
+
     public function labelMode(): ?LabelConfirmation
     {
         return LabelConfirmation::configured();
@@ -144,6 +205,7 @@ new #[Title('Producción')] class extends Component {
         }
 
         $this->lastBox = [
+            'at' => now()->format('H:i:s'),
             'order' => $scan->orderRef,
             'item' => $scan->itemCode,
             'description' => $scan->itemDescription,
@@ -296,15 +358,20 @@ new #[Title('Producción')] class extends Component {
             </div>
             <div aria-live="polite">
                 @if ($boxError)
-                    <div role="alert" class="flex h-full flex-col justify-center gap-1 rounded-xl border border-red-300 bg-red-50 p-5 text-red-800 dark:border-red-800 dark:bg-red-950 dark:text-red-200">
-                        <div class="text-lg font-semibold">Caja no contada</div>
-                        <div>{{ $boxError }}</div>
+                    <div role="alert" data-read-result="error" class="flex h-full items-center gap-4 rounded-xl border-4 border-red-600 bg-red-600 p-5 text-white shadow-lg">
+                        <flux:icon.x-circle class="size-16 shrink-0" />
+                        <div class="flex flex-col gap-1">
+                            <div class="text-2xl font-bold uppercase tracking-wide">Caja no contada</div>
+                            <div class="text-base">{{ $boxError }}</div>
+                        </div>
                     </div>
                 @elseif ($lastBox)
                     @php($percent = $lastBox['standard'] ? min(100, intdiv(($lastBox['boxes'] ?? 0) * 100, $lastBox['standard'])) : 0)
-                    <div class="flex h-full flex-col gap-3 rounded-xl border border-emerald-300 bg-emerald-50 p-5 dark:border-emerald-800 dark:bg-emerald-950">
-                        <div class="flex flex-wrap items-center gap-2">
-                            <span class="text-lg font-semibold text-zinc-900 dark:text-white">Caja contada</span>
+                    <div data-read-result="ok" wire:key="manual-{{ $lastBox['box'] }}" class="flex h-full flex-col gap-3 rounded-xl border-4 border-emerald-600 bg-emerald-50 p-5 shadow-lg dark:bg-emerald-950">
+                        <div class="-mx-5 -mt-5 flex flex-wrap items-center gap-3 rounded-t-lg bg-emerald-600 px-5 py-3 text-white">
+                            <flux:icon.check-circle class="size-10 shrink-0" />
+                            <span class="text-2xl font-bold uppercase tracking-wide">Caja contada</span>
+                            <span class="ms-auto font-mono text-sm tabular-nums">{{ $lastBox['at'] ?? '' }}</span>
                             @if ($lastBox['test_standard'])<flux:badge color="amber" size="sm">Estándar de prueba</flux:badge>@endif
                         </div>
                         <dl class="grid grid-cols-[6rem_1fr] gap-x-3 gap-y-1 text-sm">
@@ -331,6 +398,79 @@ new #[Title('Producción')] class extends Component {
             </div>
         </div>
     @endcan
+
+    @if ($line = $this->lineReads())
+        @php($last = $line['last'])
+        @php($fresh = $last !== null && $last['at']->greaterThanOrEqualTo(now()->subSeconds(15)))
+        <div class="flex flex-col gap-4 rounded-xl border border-zinc-200 p-5 dark:border-zinc-700" aria-live="polite">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+                <flux:heading size="lg" level="2">Lectura automática de la línea</flux:heading>
+                <div class="flex flex-wrap gap-2">
+                    @foreach ($line['readers'] as $reader)
+                        <flux:badge :color="$reader['connected'] === null ? 'zinc' : ($reader['connected'] ? 'green' : 'red')" :icon="$reader['connected'] === false ? 'signal-slash' : 'signal'" size="lg" title="{{ $reader['name'] }}">
+                            {{ $reader['code'] }}: {{ $reader['connected'] === null ? 'sin conectar aún' : ($reader['connected'] ? 'conectado' : 'DESCONECTADO') }}
+                        </flux:badge>
+                    @endforeach
+                </div>
+            </div>
+
+            @if ($last === null)
+                <div class="rounded-xl border border-dashed border-zinc-300 p-5 text-center text-zinc-500 dark:border-zinc-600 dark:text-zinc-400">Todavía no hay lecturas del lector de la línea.</div>
+            @elseif ($last['ok'])
+                <div data-line-result="ok" wire:key="line-{{ $last['box'] }}" @class(['flex flex-wrap items-center gap-5 rounded-xl border-4 border-emerald-600 bg-emerald-600 p-5 text-white shadow-lg', 'animate-pulse' => $fresh])>
+                    <flux:icon.check-circle class="size-16 shrink-0" />
+                    <div class="flex min-w-0 flex-1 flex-col gap-1">
+                        <div class="text-2xl font-bold uppercase tracking-wide">Caja contada</div>
+                        <div class="font-mono text-lg">{{ $last['box'] }}</div>
+                        <div class="text-sm opacity-90">OF {{ $last['order'] }} · Lote {{ $last['lot'] }} · {{ $last['reader'] }} · {{ $last['at']->timezone(config('app.timezone'))->format('H:i:s') }}</div>
+                    </div>
+                    @if ($last['pallet'])
+                        <div class="text-end">
+                            <div class="font-mono text-lg font-semibold">{{ $last['pallet'] }}</div>
+                            <div class="text-4xl font-bold tabular-nums">{{ $last['boxes'] }}<span class="text-xl font-normal opacity-80"> / {{ $last['standard'] }}</span></div>
+                        </div>
+                    @endif
+                </div>
+            @else
+                <div role="alert" data-line-result="error" wire:key="line-error-{{ $last['at']->getTimestamp() }}" @class(['flex items-center gap-5 rounded-xl border-4 border-red-700 bg-red-600 p-5 text-white shadow-lg', 'animate-pulse' => $fresh])>
+                    <flux:icon.x-circle class="size-16 shrink-0" />
+                    <div class="flex min-w-0 flex-col gap-1">
+                        <div class="text-2xl font-bold uppercase tracking-wide">Caja no contada</div>
+                        <div class="text-base">{{ $last['reason'] }}</div>
+                        <div class="text-sm opacity-90">{{ $last['reader'] }} · {{ $last['at']->timezone(config('app.timezone'))->format('H:i:s') }}@if ($last['read']) · Leyó: <span class="font-mono">{{ $last['read'] }}</span>@endif</div>
+                        <div class="text-sm font-semibold">Lee esa caja a mano.</div>
+                    </div>
+                </div>
+            @endif
+
+            <div class="grid gap-4 sm:grid-cols-2">
+                <div class="rounded-lg bg-emerald-50 p-3 text-emerald-900 dark:bg-emerald-950 dark:text-emerald-100">
+                    <div class="text-sm">Contadas por el lector (última hora)</div>
+                    <div class="text-3xl font-bold tabular-nums">{{ $line['counted'] }}</div>
+                </div>
+                <div @class(['rounded-lg p-3', 'bg-red-100 text-red-900 dark:bg-red-950 dark:text-red-100' => $line['not_counted'] > 0, 'bg-zinc-50 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200' => $line['not_counted'] === 0])>
+                    <div class="text-sm">No contadas (última hora)</div>
+                    <div class="text-3xl font-bold tabular-nums">{{ $line['not_counted'] }}</div>
+                </div>
+            </div>
+
+            @if ($line['errors'] !== [])
+                <div>
+                    <div class="mb-1 text-sm font-semibold text-red-700 dark:text-red-300">Últimas cajas no contadas por el lector</div>
+                    <ul class="divide-y divide-red-100 rounded-lg border border-red-200 text-sm dark:divide-red-900 dark:border-red-900">
+                        @foreach ($line['errors'] as $error)
+                            <li class="flex flex-wrap gap-x-3 px-3 py-2">
+                                <span class="font-mono tabular-nums">{{ $error['at']->timezone(config('app.timezone'))->format('H:i:s') }}</span>
+                                <span class="font-medium">{{ $error['reader'] }}</span>
+                                <span class="text-red-800 dark:text-red-200">{{ $error['reason'] }}</span>
+                                @if ($error['read'])<span class="font-mono text-zinc-500">{{ $error['read'] }}</span>@endif
+                            </li>
+                        @endforeach
+                    </ul>
+                </div>
+            @endif
+        </div>
+    @endif
 
     <div>
         <flux:heading size="lg" level="2" class="mb-3">En estibado</flux:heading>

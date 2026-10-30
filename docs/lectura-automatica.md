@@ -8,7 +8,7 @@ Un lector fijo en la línea lee el QR de cada caja (`TRZB:` y el código opaco) 
 - **Lecturas repetidas.** Si el lector lee dos veces la misma etiqueta mientras pasa la caja, la segunda se ignora sin alarma.
 - **Cajas no contadas.** Una lectura fallida (por ejemplo `NoRead`), una etiqueta que no es de esta aplicación o una OF que ya no está liberada no suman caja. Quedan en la bitácora del lector (`scan.rejected`, sujeto el dispositivo), en el log, y levantan la alerta "Cajas no contadas por el lector" en `/operations`. Esa caja hay que leerla a mano.
 - **Quién la leyó.** Cada lectura guarda el lector que la hizo (`pallet_scan_events.read_by_device_id`).
-- La estación de producción se refresca sola, así que muestra cómo se va llenando la estiba.
+- **Alerta en la estación de producción.** El panel "Lectura automática de la línea" muestra la última lectura del lector en grande: **verde "Caja contada"** con el código de caja y cómo va la estiba, o **rojo "Caja no contada"** con el motivo, lo que leyó y "Lee esa caja a mano". Parpadea los primeros 15 segundos de cada lectura nueva. Debajo van las contadas y no contadas de la última hora, las últimas cajas no contadas y el estado de cada lector (conectado, DESCONECTADO o sin conectar aún). Se refresca cada 5 segundos y solo aparece si hay lectores fijos activos. La lectura manual usa el mismo estilo verde y rojo.
 
 No depende de `TRACE_SCAN_INGESTION_ENABLED`, que es del endpoint de sensores que mandan OF, PT y lote (`POST /api/v1/scan-events`).
 
