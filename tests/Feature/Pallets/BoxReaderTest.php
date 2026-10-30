@@ -31,6 +31,7 @@ use Carbon\CarbonImmutable;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Str;
+use Livewire\Livewire;
 use Tests\Concerns\CreatesUsers;
 use Tests\TestCase;
 
@@ -197,6 +198,40 @@ class BoxReaderTest extends TestCase
 
         $this->travel(config()->integer('operations.heartbeat_max_age_minutes') + 1)->minutes();
         $this->assertContains('reader:LEC-L1', $alerts());
+    }
+
+    public function test_the_station_shows_each_line_read_in_green_or_red(): void
+    {
+        $station = fn () => Livewire::actingAs($this->operator)->test('pages::production.station');
+
+        $station()->assertSee('Lectura automática de la línea')->assertSee('LEC-L1: sin conectar aún')->assertSee('Todavía no hay lecturas');
+
+        Heartbeat::record(Heartbeat::reader('LEC-L1'));
+        $this->readerSession()->feed($this->box(1)."\n");
+        $box = (string) BoxLabel::query()->where('box_label_batch_id', $this->batch->id)->where('sequence', 1)->value('code');
+        $station()->assertSee('LEC-L1: conectado')
+            ->assertSeeHtml('data-line-result="ok"')
+            ->assertSee($box)
+            ->assertSee('EST-');
+
+        $this->travel(5)->seconds();
+        $this->readerSession()->feed("NoRead\n");
+        $station()->assertSeeHtml('data-line-result="error"')
+            ->assertSee('Caja no contada')
+            ->assertSee('Lee esa caja a mano')
+            ->assertSee('NoRead')
+            ->assertSee('Últimas cajas no contadas por el lector');
+
+        $this->travel(5)->seconds();
+        $this->readerSession()->feed($this->box(2)."\n");
+        $station()->assertSeeHtml('data-line-result="ok"')->assertSee('Últimas cajas no contadas por el lector');
+    }
+
+    public function test_the_station_hides_the_line_panel_without_fixed_readers(): void
+    {
+        $this->reader->forceFill(['active' => false])->save();
+
+        Livewire::actingAs($this->operator)->test('pages::production.station')->assertDontSee('Lectura automática de la línea');
     }
 
     private function bytes(string $content): string
