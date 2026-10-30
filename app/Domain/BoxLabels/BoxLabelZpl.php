@@ -53,36 +53,40 @@ final class BoxLabelZpl
         // Vencimiento en formato MM/AAAA (ej. 10/2028) fiel al formato del .lbl
         $expirationFormatted = $payload->expirationDate->format('m/Y');
 
+        // Ajuste dinamico de descripcion para evitar solapamiento en titulos largos
+        $isLongDesc = mb_strlen($payload->itemDescription) > 50;
+        $descFont = $isLongDesc ? '30,32' : '38,40';
+        $descLines = $isLongDesc ? 3 : 2;
+
         $lines = [
             '^XA',
             '^CI28',
             '^PW'.self::WIDTH_DOTS,
             '^LL'.self::HEIGHT_DOTS,
             '^LS0',
-            // Encabezado Centrado: Código PT y Descripción (Arial Black bold)
-            '^FO30,20^FB740,1,0,C^A0N,46,48^FD'.$f($payload->itemCode).'^FS',
-            '^FO30,75^FB740,2,4,C^A0N,40,42^FD'.$f($payload->itemDescription).'^FS',
+            // Encabezado Centrado: Código PT (fuente más grande) y Descripción (Arial Black bold)
+            '^FO30,18^FB740,1,0,C^A0N,54,56^FD'.$f($payload->itemCode).'^FS',
+            '^FO30,76^FB740,'.$descLines.',2,C^A0N,'.$descFont.'^FD'.$f($payload->itemDescription).'^FS',
             // Bloque izquierdo: Lote, Vencimiento, Unidades por caja
-            '^FO35,190^A0N,42,42^FDLOTE: '.$f($payload->lotCode).'^FS',
-            '^FO35,250^A0N,42,42^FDVENCE: '.$expirationFormatted.'^FS',
-            '^FO35,310^A0N,42,42^FDCAJA : '.$f($payload->unitsPerBox).' UNIDADES^FS',
-            // Código QR a la derecha en el bloque medio (más grande, ampliación 6)
-            '^FO545,150^BQN,2,6^FH_^FDMA,'.self::hexField($qrContent).'^FS',
+            '^FO35,190^A0N,40,40^FDLOTE: '.$f($payload->lotCode).'^FS',
+            '^FO35,248^A0N,40,40^FDVENCE: '.$expirationFormatted.'^FS',
+            '^FO35,306^A0N,40,40^FDCAJA : '.$f($payload->unitsPerBox).' UNIDADES^FS',
+            // Código QR a la derecha en el bloque medio (ampliación 5, totalmente libre y sin texto encima)
+            '^FO550,140^BQN,2,5^FH_^FDMA,'.self::hexField($qrContent).'^FS',
+            // Logo Tecnoal separado del QR (Y=430 para dejar margen amplio respecto al QR)
+            '^FO535,430'.self::LOGO_TECNOAL.'^FS',
         ];
 
-        // Código de caja legible debajo del QR: con él una persona identifica la caja si el QR no lee.
+        // Código de caja legible DEBAJO de Tecnoal (alineado horizontalmente con el texto del código de barras)
         if ($payload->boxCode !== null) {
-            $lines[] = '^FO492,345^FB280,1,0,C^A0N,30,30^FDCaja '.$f($payload->boxCode).'^FS';
+            $lines[] = '^FO530,560^A0N,28,22^FDCaja '.$f($payload->boxCode).'^FS';
         }
 
-        // Código de barras EAN-14 a la izquierda abajo (ITF-14 / ^B2)
+        // Código de barras EAN-14 a la izquierda abajo (ITF-14 / ^B2): altura moderada (90) y proporcion adecuada dentro del margen
         if (Itf14::isValid($payload->barcode)) {
-            $lines[] = '^FO35,410^BY4,2.5,150^B2N,150,N,N,N^FD'.$payload->barcode.'^FS';
-            $lines[] = '^FO35,570^FB490,1,0,C^A0N,30,30^FD(01)'.$payload->barcode.'^FS';
+            $lines[] = '^FO40,440^BY3,2.5,90^B2N,90,N,N,N^FD'.$payload->barcode.'^FS';
+            $lines[] = '^FO40,560^FB460,1,0,C^A0N,28,28^FD(01)'.$payload->barcode.'^FS';
         }
-
-        // Logo Tecnoal abajo a la derecha (donde estaba el QR)
-        $lines[] = '^FO535,445'.self::LOGO_TECNOAL.'^FS';
 
         $lines[] = '^PQ1,0,1,Y';
         $lines[] = '^XZ';

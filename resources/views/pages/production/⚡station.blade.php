@@ -11,12 +11,14 @@ use App\Domain\Pallets\Enums\PhysicalStatus;
 use App\Domain\Pallets\Enums\ScanEventStatus;
 use App\Domain\Pallets\Enums\ScanRejection;
 use App\Domain\Pallets\Exceptions\PalletRuleViolation;
+use App\Domain\Pallets\PalletLabelZpl;
 use App\Domain\Shared\Origin;
 use App\Domain\Shared\TraceContext;
 use App\Enums\Permission;
 use App\Models\Pallet;
 use App\Models\PalletStandard;
 use App\Models\PalletScanEvent;
+use App\Services\ZebraPrintService;
 use App\Support\Correlation\CorrelationId;
 use Flux\Flux;
 use Illuminate\Database\Eloquent\Collection;
@@ -37,6 +39,25 @@ new #[Title('Producción')] class extends Component {
     public function boot(): void
     {
         abort_unless(Auth::user()?->can(Permission::PalletsOperate->value), 403);
+    }
+
+    public string $printerIp = '192.168.1.154';
+
+    public int $printerPort = 9100;
+
+    public ?array $printerStatus = null;
+
+    public function mount(): void
+    {
+        $this->printerIp = (string) config('services.zebra.ip', env('ZEBRA_PRINTER_IP', '192.168.1.154'));
+        $this->printerPort = (int) config('services.zebra.port', env('ZEBRA_PRINTER_PORT', 9100));
+        $this->checkPrinter();
+    }
+
+    public function checkPrinter(): void
+    {
+        $zebra = app(ZebraPrintService::class);
+        $this->printerStatus = $zebra->getPrinterStatus($this->printerIp, $this->printerPort);
     }
 
     #[Locked]
@@ -219,10 +240,11 @@ new #[Title('Producción')] class extends Component {
         $this->validate(['reprintReason' => ['required', 'string', 'max:300']], attributes: ['reprintReason' => 'motivo']);
 
         $this->print($print, (int) $this->reprintingId, $this->reprintReason);
+        Flux::modal('reprint-label')->close();
     }
 
     /**
-     * Records the print, then opens the printable label.
+     * Records the print, generates vertical ZPL and transmits directly to the Zebra printer.
      */
     private function print(PrintLabel $print, int $palletId, ?string $reason): void
     {
@@ -230,11 +252,23 @@ new #[Title('Producción')] class extends Component {
         $this->run(function () use ($palletId, $print, $reason, &$printed): string {
             $printed = $print->handle(Auth::user(), $palletId, $reason, $this->context());
 
-            return 'Etiqueta generada.';
+            return 'Etiqueta registrada.';
         });
 
         if ($printed !== null) {
-            $this->redirectRoute('pallets.label', ['pallet' => $palletId, 'print' => $printed->print_number]);
+            $pallet = Pallet::query()->with('item:id,description')->find($palletId);
+            if ($pallet) {
+                $zpl = PalletLabelZpl::render($pallet, $printed);
+                $zebra = app(ZebraPrintService::class);
+                $result = $zebra->printToSocket($this->printerIp, $this->printerPort, $zpl);
+
+                if ($result['success']) {
+                    Flux::toast(variant: 'success', text: "Etiqueta de estiba {$pallet->pallet_code} impresa en Zebra ({$this->printerIp}).");
+                } else {
+                    Flux::toast(variant: 'warning', text: "Etiqueta registrada pero falló el envío a Zebra: {$result['message']}");
+                }
+                $this->checkPrinter();
+            }
         }
     }
 
@@ -277,14 +311,35 @@ new #[Title('Producción')] class extends Component {
 }; ?>
 
 <section class="flex w-full flex-col gap-6" wire:poll.5s.visible>
-    <div class="flex flex-wrap items-end justify-between gap-4">
+    <div class="flex flex-wrap items-center justify-between gap-4">
         <div>
             <flux:heading size="xl" level="1">Producción</flux:heading>
             <flux:subheading>Estibas en proceso y por despachar a paletizado</flux:subheading>
         </div>
-        @if (! config('traceability.decisions.scan_ingestion_enabled'))
-            <flux:badge color="amber" icon="exclamation-triangle" size="lg">Sensor automático apagado (DP-01): usa la lectura manual</flux:badge>
-        @endif
+
+        <div class="flex flex-wrap items-center gap-3">
+            {{-- Estado en tiempo real de la Zebra --}}
+            <div class="flex items-center gap-2 rounded-lg border border-zinc-200 bg-white px-3 py-1.5 shadow-sm dark:border-zinc-700 dark:bg-zinc-800">
+                @if ($printerStatus && ($printerStatus['online'] ?? false))
+                    <span class="inline-block h-2.5 w-2.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                    <span class="text-xs font-medium text-zinc-700 dark:text-zinc-200">
+                        Zebra ZT411 ({{ $printerIp }}): <strong class="text-emerald-600 dark:text-emerald-400">{{ $printerStatus['status_label'] }}</strong>
+                    </span>
+                @else
+                    <span class="inline-block h-2.5 w-2.5 rounded-full bg-rose-500"></span>
+                    <span class="text-xs font-medium text-zinc-700 dark:text-zinc-200">
+                        Zebra ({{ $printerIp }}): <strong class="text-rose-600 dark:text-rose-400">{{ $printerStatus['status_label'] ?? 'Sin conexión' }}</strong>
+                    </span>
+                @endif
+                <flux:button size="xs" variant="ghost" icon="arrow-path" wire:click="checkPrinter" wire:loading.attr="disabled" wire:target="checkPrinter">
+                    Verificar
+                </flux:button>
+            </div>
+
+            @if (! config('traceability.decisions.scan_ingestion_enabled'))
+                <flux:badge color="amber" icon="exclamation-triangle" size="lg">Sensor apagado (DP-01)</flux:badge>
+            @endif
+        </div>
     </div>
 
     @can('pallets.operate')

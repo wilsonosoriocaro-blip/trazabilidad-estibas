@@ -19,13 +19,29 @@
         .boxes { font-size: 8mm; }
         .meta { margin-top: auto; font-size: 3mm; color: #333; display: flex; justify-content: space-between; }
         .reprint { border: .6mm solid #000; padding: .5mm 2mm; font-weight: bold; }
-        .actions { padding: 4mm 6mm; font-family: system-ui, sans-serif; }
-        @media print { .actions { display: none; } .label { border: 0; } }
+        .actions { padding: 8px 16px; font-family: system-ui, sans-serif; display: flex; gap: 8px; align-items: center; background: #f4f4f5; border-bottom: 1px solid #e4e4e7; }
+        .actions button, .actions a { font-size: 13px; font-weight: 500; padding: 6px 12px; border-radius: 6px; cursor: pointer; text-decoration: none; border: 1px solid #d4d4d8; background: #fff; color: #18181b; }
+        .actions button.primary { background: #18181b; color: #fff; border-color: #18181b; }
+        .alert-success { background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; padding: 8px 16px; font-size: 13px; }
+        .alert-error { background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; padding: 8px 16px; font-size: 13px; }
+        @media print { .actions, .alert-success, .alert-error { display: none !important; } .label { border: 0; } }
     </style>
 </head>
 <body>
+    @if (session('status'))
+        <div class="alert-success">{{ session('status') }}</div>
+    @endif
+    @if ($errors->has('zebra'))
+        <div class="alert-error">{{ $errors->first('zebra') }}</div>
+    @endif
+
     <div class="actions">
-        <button type="button" onclick="window.print()">Imprimir</button>
+        <form method="POST" action="{{ route('pallets.label.print-direct', ['pallet' => $pallet->id, 'print' => $print->print_number]) }}">
+            @csrf
+            <button type="submit" class="primary">Imprimir en Zebra ({{ $printerIp }})</button>
+        </form>
+        <a href="{{ route('pallets.label.zpl', ['pallet' => $pallet->id, 'print' => $print->print_number]) }}">Descargar ZPL</a>
+        <button type="button" onclick="window.print()">Impresión navegador</button>
         <a href="{{ url()->previous() }}">Volver</a>
     </div>
 
@@ -37,14 +53,11 @@
             <tr><th>Producto</th><td>{{ $pallet->item_code }}<br><span style="font-weight: normal">{{ $pallet->item->description }}</span></td></tr>
             <tr><th>Lote</th><td>{{ $pallet->lot_code }}</td></tr>
             <tr><th>Vence</th><td>{{ $expiration?->format('d/m/Y') ?? '—' }}</td></tr>
-            <tr><th>Cajas</th><td class="boxes">{{ $pallet->boxes_count }}</td></tr>
         </table>
         <div class="meta">
             <span>Impresión #{{ $print->print_number }} · {{ $print->printed_at->timezone(config('app.timezone'))->format('d/m/Y H:i') }}</span>
             @if ($print->print_number > 1)<span class="reprint">REIMPRESIÓN</span>@endif
         </div>
     </main>
-
-    <script>window.addEventListener('load', () => window.print());</script>
 </body>
 </html>

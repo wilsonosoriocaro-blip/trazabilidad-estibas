@@ -4,6 +4,7 @@ use App\Domain\Integration\Enums\PalletHold;
 use App\Domain\Integration\Enums\SapDocumentStatus;
 use App\Domain\Pallets\Actions\PrintLabel;
 use App\Domain\Pallets\Exceptions\PalletRuleViolation;
+use App\Domain\Pallets\PalletLabelZpl;
 use App\Domain\Shared\Origin;
 use App\Domain\Shared\TraceContext;
 use App\Domain\Transfers\Actions\RequestInventoryTransfers;
@@ -17,6 +18,7 @@ use App\Models\InventoryTransfer;
 use App\Models\Pallet;
 use App\Models\PalletLabelPrint;
 use App\Queries\PalletTimeline;
+use App\Services\ZebraPrintService;
 use App\Support\Correlation\CorrelationId;
 use Flux\Flux;
 use Illuminate\Database\Eloquent\Collection;
@@ -140,6 +142,20 @@ new #[Title('Detalle de estiba')] class extends Component {
 
         try {
             $printed = $print->handle(Auth::user(), $this->palletId, $this->reprintReason, TraceContext::forUser(Auth::user(), Origin::Web, app(CorrelationId::class)->get(), request()->ip()));
+            $pallet = $this->pallet;
+            if ($pallet) {
+                $zpl = PalletLabelZpl::render($pallet, $printed);
+                $ip = (string) config('services.zebra.ip', env('ZEBRA_PRINTER_IP', '192.168.1.154'));
+                $port = (int) config('services.zebra.port', env('ZEBRA_PRINTER_PORT', 9100));
+                $zebra = app(ZebraPrintService::class);
+                $result = $zebra->printToSocket($ip, $port, $zpl);
+
+                if ($result['success']) {
+                    Flux::toast(variant: 'success', text: "Reimpresión de {$pallet->pallet_code} transmitida a la Zebra ({$ip}).");
+                } else {
+                    Flux::toast(variant: 'warning', text: "Reimpresión registrada pero falló envío a Zebra: {$result['message']}");
+                }
+            }
         } catch (PalletRuleViolation $e) {
             Flux::toast(variant: 'danger', text: $e->getMessage());
 
