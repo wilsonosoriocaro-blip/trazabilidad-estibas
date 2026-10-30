@@ -18,6 +18,8 @@ enum Permission: string
     case PalletsReprint = 'pallets.reprint';
     /** Look up a production order in SAP and generate the QR labels for its boxes. */
     case BoxLabelsPrint = 'box_labels.print';
+    /** Use another lot than OF + Julian day when generating box labels, while that lot has no Zebra prints. */
+    case BoxLabelsChangeLot = 'box_labels.change_lot';
     /** Production order board: progress against SAP, refresh from SAP, "ready to close" alert. */
     case OrdersView = 'orders.view';
     /** Evaluate a rejected scan event again after fixing a master. */

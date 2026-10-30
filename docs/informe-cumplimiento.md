@@ -180,7 +180,8 @@ Los textos de CA-01 a CA-18 los propuse en la Fase 0 porque el prompt no los tra
 | El QR se lee como las líneas de la etiqueta (OF, producto, descripción, lote, vence, contenido); el EAN-14 va aparte como ITF-14 | `BoxLabelsTest::test_the_qr_reads_as_the_lines_of_the_label_and_the_ean14_goes_apart`, `BoxLabelsTest::test_the_ean14_check_digit_and_itf14_pattern_follow_gs1` |
 | ZPL de 10 × 8 cm con la cantidad pedida | `BoxLabelsTest::test_the_zpl_is_a_10_by_8_cm_label_printed_as_many_times_as_asked` |
 | Texto de SAP no inyecta comandos ZPL | `BoxLabelsTest::test_text_from_sap_can_never_inject_zpl_commands` |
-| Una OF no recibe más etiquetas que las que llena su cantidad planificada, tampoco en paralelo | `BoxLabelsTest::test_an_order_never_gets_more_labels_than_its_planned_quantity_fills`, `BoxLabelConcurrencyTest::test_parallel_batches_never_pass_the_planned_quantity` |
+| Sin límite de etiquetas por OF: pasar la cantidad sugerida queda registrado; en paralelo los códigos de caja no se repiten ni dejan huecos | `BoxLabelsTest::test_an_order_can_get_more_labels_than_its_planned_quantity_suggests`, `BoxLabelConcurrencyTest::test_parallel_batches_continue_the_lot_without_gaps_or_repeats` |
+| Solo el supervisor cambia el lote, mientras el lote por defecto no tenga impresiones en la Zebra | `BoxLabelLotTest::test_only_a_supervisor_changes_the_lot_and_only_to_a_valid_one`, `BoxLabelLotTest::test_once_the_default_lot_is_printed_on_the_zebra_it_can_no_longer_be_changed` |
 | Lo impreso queda como evidencia inmutable | `BoxLabelsTest::test_a_generated_batch_is_evidence_and_never_changes` |
 | Permisos en el servidor | `BoxLabelsTest::test_only_people_with_box_labels_print_consult_and_generate`, `BoxLabelsTest::test_the_page_and_the_download_need_the_permission` |
 | Un lote tiene un solo vencimiento entre tandas | `BoxLabelsTest::test_a_lot_keeps_one_expiration_date_across_batches` |

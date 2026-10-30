@@ -301,19 +301,21 @@ class BoxLabelsTest extends TestCase
         $this->assertSame(3, BoxLabelBatch::query()->count());
     }
 
-    public function test_an_order_never_gets_more_labels_than_its_planned_quantity_fills(): void
+    public function test_an_order_can_get_more_labels_than_its_planned_quantity_suggests(): void
     {
-        // 800 units at 24 per box: 33 full boxes and one of 8, so 34 labels.
+        // 800 units at 24 per box: 33 full boxes and one of 8, so 34 labels suggested.
         $order = $this->ready();
         $this->assertSame(34, GenerateBoxLabels::maxLabels('800.000000', '24.000000'));
 
         $this->generate($order, 30);
-        $this->expectViolation(fn () => $this->generate($order, 5), 'entre 1 y 4');
-        $this->generate($order, 4);
-        $this->expectViolation(fn () => $this->generate($order, 1), 'Ya se generaron todas');
-        $this->expectViolation(fn () => $this->generate($order, 0), 'Ya se generaron todas');
+        // Misprints and damaged boxes: going over the suggestion is allowed and stays on record.
+        $this->generate($order, 10);
+        $this->expectViolation(fn () => $this->generate($order, 0), 'al menos 1');
 
-        $this->assertSame(34, (int) BoxLabelBatch::query()->sum('labels'));
+        $this->assertSame(40, (int) BoxLabelBatch::query()->sum('labels'));
+        $this->assertSame('33128293-0040', BoxLabel::query()->orderByDesc('sequence')->value('code'));
+        $context = TraceEvent::query()->where('event', TraceEventType::BoxLabelsGenerated->value)->latest('id')->value('context');
+        $this->assertSame([34, 30, 10], [$context['suggested_labels'] ?? null, $context['labels_before'] ?? null, $context['labels'] ?? null]);
     }
 
     public function test_labels_need_a_consulted_order_a_barcode_units_per_box_and_a_past_production_date(): void

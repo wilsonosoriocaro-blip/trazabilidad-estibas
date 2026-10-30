@@ -2,6 +2,7 @@
 
 use App\Domain\BoxLabels\Actions\ConsultProductionOrder;
 use App\Domain\BoxLabels\Actions\GenerateBoxLabels;
+use App\Domain\BoxLabels\Actions\PrintBoxLabels;
 use App\Domain\BoxLabels\BoxLabelPayload;
 use App\Domain\BoxLabels\BoxLabelQr;
 use App\Domain\BoxLabels\BoxLabelZpl;
@@ -18,6 +19,7 @@ use App\Integrations\Sap\Enums\ProductionOrderStatus;
 use App\Models\BoxConversionFactor;
 use App\Models\BoxLabel;
 use App\Models\BoxLabelBatch;
+use App\Models\BoxLabelPrint;
 use App\Models\ProductionOrder;
 use App\Services\ZebraPrintService;
 use App\Support\Correlation\CorrelationId;
@@ -51,6 +53,9 @@ new #[Title('Etiquetas de caja')] class extends Component {
     public string $productionDate = '';
 
     public string $expirationDate = '';
+
+    /** Lot typed by a supervisor; empty means OF + Julian day. */
+    public string $lotCode = '';
 
     #[Locked]
     public ?int $batchId = null;
@@ -86,8 +91,8 @@ new #[Title('Etiquetas de caja')] class extends Component {
             return;
         }
 
-        $zebra = app(ZebraPrintService::class);
-        $result = $zebra->printToSocket($this->printerIp, $this->printerPort, $targetBatch->zpl);
+        $result = app(PrintBoxLabels::class)->handle(Auth::user(), $targetBatch->id, $this->printerIp, $this->printerPort, $this->context());
+        unset($this->order);
 
         if ($result['success']) {
             Flux::toast(variant: 'success', text: "{$targetBatch->labels} etiquetas transmitidas a la Zebra ({$this->printerIp}).");
@@ -129,6 +134,34 @@ new #[Title('Etiquetas de caja')] class extends Component {
         return (int) $this->order?->boxLabelBatches->sum('labels');
     }
 
+    public function canChangeLot(): bool
+    {
+        return (bool) Auth::user()?->can(Permission::BoxLabelsChangeLot->value);
+    }
+
+    /** OF + Julian day of the production date being filled in. */
+    public function defaultLot(): ?string
+    {
+        $production = $this->date($this->productionDate);
+
+        return $this->order === null || $production === null ? null : BoxLot::code($this->order->ref, $production);
+    }
+
+    /** The lot the next batch will carry: the supervisor's, or the default one. */
+    public function lot(): ?string
+    {
+        $typed = trim($this->lotCode);
+
+        return $typed !== '' && $this->canChangeLot() ? $typed : $this->defaultLot();
+    }
+
+    public function defaultLotPrinted(): bool
+    {
+        $default = $this->defaultLot();
+
+        return $default !== null && BoxLabelPrint::lotPrinted((int) $this->orderId, $default);
+    }
+
     #[Computed]
     public function batch(): ?BoxLabelBatch
     {
@@ -158,7 +191,7 @@ new #[Title('Etiquetas de caja')] class extends Component {
             itemDescription: $this->order->item->description,
             unitsPerBox: (new Quantity((string) $this->factor->units_per_box))->display(),
             uomName: $this->order->uom_name ?? $this->order->item->inventory_uom,
-            lotCode: BoxLot::code($this->order->ref, $production),
+            lotCode: (string) $this->lot(),
             barcode: (string) Itf14::forBox($this->order->item->barcode, Itf14::indicator()),
             expirationDate: $expiration,
         );
@@ -167,7 +200,7 @@ new #[Title('Etiquetas de caja')] class extends Component {
     public function consult(ConsultProductionOrder $consult): void
     {
         $this->validate(['docNum' => ['required', 'string', 'max:20']], attributes: ['docNum' => 'número de OF']);
-        $this->reset('orderId', 'batchId', 'labels');
+        $this->reset('orderId', 'batchId', 'labels', 'lotCode');
         unset($this->order, $this->factor, $this->batch);
 
         try {
@@ -203,10 +236,11 @@ new #[Title('Etiquetas de caja')] class extends Component {
             'labels' => ['required', 'integer', 'min:1'],
             'productionDate' => ['required', 'date_format:Y-m-d'],
             'expirationDate' => ['required', 'date_format:Y-m-d'],
-        ], attributes: ['labels' => 'cantidad de etiquetas', 'productionDate' => 'fecha de producción', 'expirationDate' => 'fecha de vencimiento']);
+            'lotCode' => ['nullable', 'string', 'max:40'],
+        ], attributes: ['labels' => 'cantidad de etiquetas', 'productionDate' => 'fecha de producción', 'expirationDate' => 'fecha de vencimiento', 'lotCode' => 'lote']);
 
         try {
-            $batch = $generate->handle(Auth::user(), (int) $this->orderId, $this->labels, $this->date($this->productionDate) ?? today(), $this->date($this->expirationDate), $this->context());
+            $batch = $generate->handle(Auth::user(), (int) $this->orderId, $this->labels, $this->date($this->productionDate) ?? today(), $this->date($this->expirationDate), $this->context(), trim($this->lotCode) === '' ? null : $this->lotCode);
         } catch (BoxLabelRuleViolation $e) {
             Flux::toast(variant: 'danger', text: $e->getMessage());
 
@@ -214,6 +248,7 @@ new #[Title('Etiquetas de caja')] class extends Component {
         }
 
         $this->batchId = $batch->id;
+        $this->lotCode = '';
         unset($this->order, $this->batch);
         Flux::toast(variant: 'success', text: "{$batch->labels} etiquetas generadas. Lista para imprimir en Zebra o descargar ZPL.");
     }
@@ -322,18 +357,36 @@ new #[Title('Etiquetas de caja')] class extends Component {
                         @if ($order->item->barcode && strlen(trim($order->item->barcode)) === 13)<div class="text-xs font-normal text-zinc-500">Desde el EAN-13 de SAP {{ $order->item->barcode }}</div>@endif
                     </dd>
                     <dt class="text-zinc-500">Etiquetas generadas</dt>
-                    <dd class="font-medium tabular-nums">{{ $printed }}{{ $max === null ? '' : ' de '.$max }}</dd>
+                    <dd class="font-medium tabular-nums">{{ $printed }}</dd>
+                    <dt class="text-zinc-500">Sugeridas por la OF</dt>
+                    <dd class="font-medium tabular-nums">{{ $max ?? '—' }} <span class="text-xs font-normal text-zinc-500">(se puede generar más)</span></dd>
                 </dl>
 
                 <form wire:submit="generate" class="flex flex-col gap-4">
                     <div class="grid gap-4 sm:grid-cols-3">
-                        <flux:input wire:model="labels" type="number" min="1" :max="$max === null ? null : max($max - $printed, 1)" label="Cantidad de etiquetas" required />
+                        <flux:input wire:model.live.debounce.400ms="labels" type="number" min="1" label="Cantidad de etiquetas" required />
                         <flux:input wire:model.live="productionDate" type="date" label="Fecha de producción" required />
                         <flux:input wire:model.live="expirationDate" type="date" label="Fecha de vencimiento" required />
                     </div>
-                    <flux:text class="text-sm">Lote: <span class="font-mono font-medium">{{ $preview?->lotCode ?? ($this->date($productionDate) ? BoxLot::code($order->ref, $this->date($productionDate)) : '—') }}</span> (OF + día juliano de la fecha de producción)</flux:text>
+                    @php($defaultLot = $this->defaultLot())
+                    @if ($this->canChangeLot())
+                        @if ($this->defaultLotPrinted())
+                            <flux:text class="text-sm">Lote: <span class="font-mono font-medium">{{ $defaultLot }}</span>. Ya tiene etiquetas impresas en la Zebra: no se puede cambiar.</flux:text>
+                        @else
+                            <div>
+                                <flux:input wire:model.live.debounce.400ms="lotCode" label="Lote" :placeholder="$defaultLot" maxlength="40" autocomplete="off"
+                                    description="Vacío usa {{ $defaultLot ?? 'OF + día juliano' }} (OF + día juliano). Solo cámbialo si el lote es otro; se puede mientras no haya etiquetas impresas de ese lote." />
+                            </div>
+                        @endif
+                    @else
+                        <flux:text class="text-sm">Lote: <span class="font-mono font-medium">{{ $defaultLot ?? '—' }}</span> (OF + día juliano de la fecha de producción)</flux:text>
+                    @endif
+                    @php($over = $max === null ? 0 : $printed + (int) $labels - $max)
+                    @if ($over > 0)
+                        <flux:callout variant="warning" icon="exclamation-triangle" heading="Supera lo sugerido por la OF en {{ $over }} etiquetas" text="Se permite para reponer etiquetas mal impresas o cajas averiadas. Queda registrado." />
+                    @endif
                     <flux:button type="submit" variant="primary" icon="qr-code" wire:loading.attr="disabled" wire:target="generate"
-                        wire:confirm="¿Generar {{ $labels }} etiquetas de caja para la OF {{ $order->ref }}?">Generar etiquetas</flux:button>
+                        wire:confirm="¿Generar {{ $labels }} etiquetas de caja para la OF {{ $order->ref }} con el lote {{ $this->lot() }}?{{ $over > 0 ? ' Supera en '.$over.' las sugeridas por la OF.' : '' }}">Generar etiquetas</flux:button>
                 </form>
             </div>
 
@@ -455,6 +508,7 @@ new #[Title('Etiquetas de caja')] class extends Component {
         </div>
 
         @if ($order->boxLabelBatches->isNotEmpty())
+            @php($prints = BoxLabelPrint::query()->where('production_order_id', $order->id)->selectRaw('box_label_batch_id, count(*) as n')->groupBy('box_label_batch_id')->pluck('n', 'box_label_batch_id')->map(fn ($n) => (int) $n)->all())
             <div>
                 <flux:heading size="lg" level="2" class="mb-3">Etiquetas generadas para esta orden</flux:heading>
                 <flux:table>
@@ -464,6 +518,7 @@ new #[Title('Etiquetas de caja')] class extends Component {
                         <flux:table.column>Vence</flux:table.column>
                         <flux:table.column align="end">Etiquetas</flux:table.column>
                         <flux:table.column>Por</flux:table.column>
+                        <flux:table.column align="end">Impresa en Zebra</flux:table.column>
                         <flux:table.column align="end"><span class="sr-only">Acciones</span></flux:table.column>
                     </flux:table.columns>
                     <flux:table.rows>
@@ -474,6 +529,7 @@ new #[Title('Etiquetas de caja')] class extends Component {
                                 <flux:table.cell>{{ $b->expiration_date->format('d/m/Y') }}</flux:table.cell>
                                 <flux:table.cell align="end" class="tabular-nums">{{ $b->labels }}</flux:table.cell>
                                 <flux:table.cell>{{ $b->generator->name }}</flux:table.cell>
+                                <flux:table.cell align="end" class="tabular-nums">{{ ($prints[$b->id] ?? 0) === 0 ? 'No' : $prints[$b->id].' '.(($prints[$b->id] ?? 0) === 1 ? 'vez' : 'veces') }}</flux:table.cell>
                                 <flux:table.cell align="end">
                                     <div class="flex items-center justify-end gap-1">
                                         <flux:button size="sm" variant="ghost" icon="printer" wire:click="printBatchDirect({{ $b->id }})" title="Imprimir directo en Zebra">Imprimir</flux:button>

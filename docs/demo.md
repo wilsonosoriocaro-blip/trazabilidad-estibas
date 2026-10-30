@@ -57,7 +57,7 @@ Ver `docs/tablero-de-of.md`.
 
 ## Etiquetas de caja
 
-Entrar como `produccion@example.com` en `/box-labels` y consultar la OF 33128. Se ve el encabezado guardado y se pueden generar etiquetas (ya hay 55 generadas por la demo; el máximo es 67: 800 unidades a 12 por caja). Para ver los rechazos: 33129 (planificada), 33130 (cerrada), 33133 (cancelada) o un número que no exista. Ver `docs/etiquetas-de-caja.md`.
+Entrar como `produccion@example.com` en `/box-labels` y consultar la OF 33128. Se ve el encabezado guardado y se pueden generar etiquetas (ya hay 55 generadas por la demo; las sugeridas son 67: 800 unidades a 12 por caja, y se pueden generar más). Cambiar el lote lo puede hacer un usuario con el rol Supervisor de producción (o Administrador). Para ver los rechazos: 33129 (planificada), 33130 (cerrada), 33133 (cancelada) o un número que no exista. Ver `docs/etiquetas-de-caja.md`.
 
 ## Usuarios
 

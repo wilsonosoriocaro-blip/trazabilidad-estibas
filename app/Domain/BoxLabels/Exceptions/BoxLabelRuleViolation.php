@@ -51,11 +51,29 @@ class BoxLabelRuleViolation extends DomainException
         return new self("El producto {$itemCode} no tiene unidades por caja vigentes (DP-02). Sin eso no se genera la etiqueta.");
     }
 
-    public static function invalidQuantity(int $remaining): self
+    public static function invalidQuantity(): self
     {
-        return $remaining > 0
-            ? new self("La cantidad de etiquetas debe estar entre 1 y {$remaining}, lo que falta para completar la orden.")
-            : new self('Ya se generaron todas las etiquetas que alcanza la cantidad planificada de la orden.');
+        return new self('La cantidad de etiquetas debe ser al menos 1.');
+    }
+
+    public static function lotChangeNotAllowed(): self
+    {
+        return new self('Solo un supervisor puede cambiar el lote de las etiquetas.');
+    }
+
+    public static function invalidLot(): self
+    {
+        return new self('El lote solo puede tener letras, números, punto, guion, guion bajo o /, hasta 40 caracteres.');
+    }
+
+    public static function lotAlreadyPrinted(string $lotCode): self
+    {
+        return new self("El lote {$lotCode} ya tiene etiquetas impresas en la Zebra. Ya no se puede cambiar por otro.");
+    }
+
+    public static function lotOfAnotherOrder(string $lotCode, string $orderRef): self
+    {
+        return new self("El lote {$lotCode} ya es de la OF {$orderRef}. Usa otro lote.");
     }
 
     public static function futureProductionDate(): self

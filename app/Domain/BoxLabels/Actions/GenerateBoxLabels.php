@@ -18,6 +18,7 @@ use App\Integrations\Sap\Enums\ProductionOrderStatus;
 use App\Models\BoxConversionFactor;
 use App\Models\BoxLabel;
 use App\Models\BoxLabelBatch;
+use App\Models\BoxLabelPrint;
 use App\Models\Item;
 use App\Models\ProductionOrder;
 use App\Models\User;
@@ -28,9 +29,13 @@ use Illuminate\Support\Facades\Gate;
 
 /**
  * Generates a batch of identical box labels for a released production
- * order. The operator chooses how many; across all batches an order never
- * gets more labels than its planned quantity fills, at the current units
- * per box (rounding the last box up).
+ * order. The operator chooses how many, with no limit per order: labels
+ * get misprinted and labelled boxes get damaged. maxLabels() is only the
+ * suggestion (the boxes the planned quantity fills).
+ *
+ * The lot is OF + Julian day of the production date. A supervisor
+ * (box_labels.change_lot) may use another one while the default lot has no
+ * Zebra prints; a lot never belongs to two orders.
  *
  * The batch keeps the exact QR text and ZPL, so what was printed can
  * always be shown again.
@@ -39,7 +44,9 @@ class GenerateBoxLabels
 {
     public function __construct(private readonly TraceLogger $trace) {}
 
-    public function handle(User $user, int $productionOrderId, int $labels, CarbonImmutable $productionDate, ?CarbonImmutable $expirationDate, TraceContext $ctx): BoxLabelBatch
+    public const LOT_PATTERN = '/^[A-Za-z0-9._\/-]{1,40}$/';
+
+    public function handle(User $user, int $productionOrderId, int $labels, CarbonImmutable $productionDate, ?CarbonImmutable $expirationDate, TraceContext $ctx, ?string $lotCode = null): BoxLabelBatch
     {
         Gate::forUser($user)->authorize(Permission::BoxLabelsPrint->value);
 
@@ -47,8 +54,14 @@ class GenerateBoxLabels
             throw BoxLabelRuleViolation::futureProductionDate();
         }
 
-        return DB::transaction(function () use ($user, $productionOrderId, $labels, $productionDate, $expirationDate, $ctx): BoxLabelBatch {
-            // The lock serialises batches of one order, so two operators cannot pass the limit together.
+        if ($labels < 1) {
+            throw BoxLabelRuleViolation::invalidQuantity();
+        }
+
+        $lotCode = $lotCode === null ? null : trim($lotCode);
+
+        return DB::transaction(function () use ($user, $productionOrderId, $labels, $productionDate, $expirationDate, $ctx, $lotCode): BoxLabelBatch {
+            // The lock serialises batches of one order: box codes continue the lot without gaps or repeats.
             $order = ProductionOrder::query()->lockForUpdate()->findOrFail($productionOrderId);
 
             if ($order->consulted_at === null || $order->planned_quantity === null) {
@@ -74,12 +87,8 @@ class GenerateBoxLabels
                 throw BoxLabelRuleViolation::noFactor($item->code);
             }
 
-            $remaining = self::maxLabels((string) $order->planned_quantity, (string) $factor->units_per_box)
-                - (int) BoxLabelBatch::query()->where('production_order_id', $order->id)->sum('labels');
-
-            if ($labels < 1 || $labels > $remaining) {
-                throw BoxLabelRuleViolation::invalidQuantity(max($remaining, 0));
-            }
+            $suggested = self::maxLabels((string) $order->planned_quantity, (string) $factor->units_per_box);
+            $generated = (int) BoxLabelBatch::query()->where('production_order_id', $order->id)->sum('labels');
 
             $productionDate = $productionDate->startOfDay();
             $expirationDate = ($expirationDate ?? ($item->shelf_life_days === null ? null : $productionDate->addDays($item->shelf_life_days)))?->startOfDay();
@@ -88,7 +97,30 @@ class GenerateBoxLabels
                 throw BoxLabelRuleViolation::invalidExpiration();
             }
 
-            $lotCode = BoxLot::code($order->ref, $productionDate);
+            $defaultLot = BoxLot::code($order->ref, $productionDate);
+
+            if ($lotCode !== null && $lotCode !== '' && $lotCode !== $defaultLot) {
+                if (! Gate::forUser($user)->allows(Permission::BoxLabelsChangeLot->value)) {
+                    throw BoxLabelRuleViolation::lotChangeNotAllowed();
+                }
+
+                if (preg_match(self::LOT_PATTERN, $lotCode) !== 1) {
+                    throw BoxLabelRuleViolation::invalidLot();
+                }
+
+                if (BoxLabelPrint::lotPrinted($order->id, $defaultLot)) {
+                    throw BoxLabelRuleViolation::lotAlreadyPrinted($defaultLot);
+                }
+            } else {
+                $lotCode = $defaultLot;
+            }
+
+            // Box codes carry the lot: a lot of another order would mix both orders' boxes.
+            $owner = BoxLabelBatch::query()->where('lot_code', $lotCode)->where('production_order_id', '!=', $order->id)->value('production_order_ref');
+            if ($owner !== null) {
+                throw BoxLabelRuleViolation::lotOfAnotherOrder($lotCode, (string) $owner);
+            }
+
             $lotExpiration = LotDates::expiration($order->id, $lotCode);
 
             // In SAP a lot has one expiration date: every label set of the lot must carry the same.
@@ -150,6 +182,10 @@ class GenerateBoxLabels
                 'box_label_batch_id' => $batch->id,
                 'labels' => $labels,
                 'lot_code' => $payload->lotCode,
+                ...($lotCode === $defaultLot ? [] : ['default_lot_code' => $defaultLot]),
+                // Over the suggestion is allowed (misprints, damaged boxes) and stays on record.
+                'suggested_labels' => $suggested,
+                'labels_before' => $generated,
                 'expiration_date' => $expirationDate->toDateString(),
                 'qr_payload' => $batch->qr_payload,
             ]);
