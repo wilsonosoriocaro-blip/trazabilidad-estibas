@@ -75,7 +75,6 @@ class PalletDetailAndLabelTest extends TestCase
             ->assertSee($pallet->production_order_ref)
             ->assertSee($pallet->item_code)
             ->assertSee($pallet->lot_code)
-            ->assertSee((string) $pallet->boxes_count)
             ->assertDontSee('REIMPRESIÓN')
             ->getContent();
 

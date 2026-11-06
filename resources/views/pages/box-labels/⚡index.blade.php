@@ -2,6 +2,7 @@
 
 use App\Domain\BoxLabels\Actions\ConsultProductionOrder;
 use App\Domain\BoxLabels\Actions\GenerateBoxLabels;
+use App\Domain\BoxLabels\Actions\ManagePrintJob;
 use App\Domain\BoxLabels\Actions\PrintBoxLabels;
 use App\Domain\BoxLabels\BoxLabelPayload;
 use App\Domain\BoxLabels\BoxLabelQr;
@@ -9,7 +10,9 @@ use App\Domain\BoxLabels\BoxLabelZpl;
 use App\Domain\BoxLabels\BoxLot;
 use App\Domain\BoxLabels\BoxQr;
 use App\Domain\BoxLabels\Itf14;
+use App\Domain\BoxLabels\LabelFormatConfig;
 use App\Domain\BoxLabels\Exceptions\BoxLabelRuleViolation;
+use App\Domain\BoxLabels\Services\ZebraSessionLock;
 use App\Domain\Integration\Enums\MasterStatus;
 use App\Domain\Shared\Origin;
 use App\Domain\Shared\TraceContext;
@@ -20,6 +23,7 @@ use App\Models\BoxConversionFactor;
 use App\Models\BoxLabel;
 use App\Models\BoxLabelBatch;
 use App\Models\BoxLabelPrint;
+use App\Models\BoxLabelPrintJob;
 use App\Models\ProductionOrder;
 use App\Services\ZebraPrintService;
 use App\Support\Correlation\CorrelationId;
@@ -60,24 +64,61 @@ new #[Title('Etiquetas de caja')] class extends Component {
     #[Locked]
     public ?int $batchId = null;
 
-    public string $printerIp = '192.168.1.154';
+    public string $printerIp = '192.168.1.155';
 
     public int $printerPort = 9100;
+
+    public int $printSpeed = 6;
+
+    public ?int $activeJobId = null;
+
+    public ?int $lastToastedJobId = null;
+
+    public bool $isPrinting = false;
+
+    public ?int $resumeSequence = null;
 
     public ?array $printerStatus = null;
 
     public function mount(): void
     {
         $this->productionDate = today()->toDateString();
-        $this->printerIp = (string) config('services.zebra.ip', env('ZEBRA_PRINTER_IP', '192.168.1.154'));
+        $this->printerIp = (string) config('services.zebra.ip', env('ZEBRA_PRINTER_IP', '192.168.1.155'));
         $this->printerPort = (int) config('services.zebra.port', env('ZEBRA_PRINTER_PORT', 9100));
+        $this->printSpeed = LabelFormatConfig::printSpeed();
         $this->checkPrinter();
+    }
+
+    public function setZebraSpeed(int $speed): void
+    {
+        $speed = max(2, min(14, $speed));
+        LabelFormatConfig::setPrintSpeed($speed);
+        $this->printSpeed = $speed;
+        Flux::modal('zebra-speed-modal')->close();
+        Flux::toast(variant: 'success', text: "Velocidad de impresión ajustada a {$speed} ips.");
     }
 
     public function checkPrinter(): void
     {
         $zebra = app(ZebraPrintService::class);
         $this->printerStatus = $zebra->getPrinterStatus($this->printerIp, $this->printerPort);
+    }
+
+    #[Computed]
+    public function activeJob(): ?BoxLabelPrintJob
+    {
+        return $this->activeJobId === null ? null : BoxLabelPrintJob::query()->with('batch')->find($this->activeJobId);
+    }
+
+    public function openJobMonitor(int $jobId): void
+    {
+        $this->activeJobId = $jobId;
+        $job = BoxLabelPrintJob::query()->find($jobId);
+        if ($job) {
+            $this->resumeSequence = $job->next_sequence;
+            $this->isPrinting = ($job->status === 'printing');
+        }
+        Flux::modal('zebra-print-monitor-modal')->show();
     }
 
     public function printBatchDirect(?int $batchId = null): void
@@ -91,16 +132,177 @@ new #[Title('Etiquetas de caja')] class extends Component {
             return;
         }
 
-        $result = app(PrintBoxLabels::class)->handle(Auth::user(), $targetBatch->id, $this->printerIp, $this->printerPort, $this->context());
-        unset($this->order);
-
-        if ($result['success']) {
-            Flux::toast(variant: 'success', text: "{$targetBatch->labels} etiquetas transmitidas a la Zebra ({$this->printerIp}).");
-        } else {
-            Flux::toast(variant: 'danger', text: $result['message']);
+        // Validación de bloqueo de sesión exclusivo para la impresora Zebra
+        $lock = app(ZebraSessionLock::class)->getActiveLockForOther($this->printerIp, $this->printerPort, $this->activeJobId, session()->getId());
+        if ($lock !== null) {
+            Flux::toast(variant: 'warning', text: "La impresora está en uso por {$lock['user_name']} (Lote {$lock['lot_code']}, Trabajo #{$lock['job_id']}). No se permiten impresiones concurrentes.");
+            return;
         }
 
-        $this->checkPrinter();
+        $manageJob = app(ManagePrintJob::class);
+        $job = $manageJob->createOrGetJob(Auth::user(), $targetBatch->id, $this->printerIp, $this->printerPort);
+        $this->activeJobId = $job->id;
+        $this->resumeSequence = $job->next_sequence;
+
+        // Si ya estaba completado, permitir reimprimir reiniciando el trabajo
+        if ($job->status === 'completed') {
+            $job->forceFill([
+                'printed_labels' => 0,
+                'pending_labels' => $job->total_labels,
+                'last_printed_sequence' => 0,
+                'next_sequence' => $job->start_sequence,
+                'status' => 'printing',
+                'error_reason' => null,
+                'started_at' => now(),
+                'completed_at' => null,
+            ])->save();
+            $this->resumeSequence = $job->start_sequence;
+        }
+
+        // Siempre abrir el monitor interactivo y procesar de forma estrictamente granular
+        $this->isPrinting = true;
+        Flux::modal('zebra-print-monitor-modal')->show();
+
+        // Ejecutar el primer paso inmediatamente
+        $this->processActivePrintJob();
+    }
+
+    public function processActivePrintJob(): void
+    {
+        if ($this->activeJobId === null) {
+            $this->isPrinting = false;
+            return;
+        }
+
+        $job = BoxLabelPrintJob::query()->with('batch')->find($this->activeJobId);
+        if (! $job) {
+            $this->activeJobId = null;
+            $this->isPrinting = false;
+            return;
+        }
+
+        // Si el trabajo ya está completado, detener polling y mantener el modal visible para el usuario
+        if ($job->status === 'completed' || $job->pending_labels <= 0) {
+            $this->isPrinting = false;
+            return;
+        }
+
+        // Si no está en estado de impresión activa (ej: error o cancelado), detener polling
+        if ($job->status !== 'printing') {
+            $this->isPrinting = false;
+            return;
+        }
+
+        $manageJob = app(ManagePrintJob::class);
+        $result = $manageJob->processChunk($job, $this->context());
+        $freshJob = $job->fresh();
+        $this->resumeSequence = $freshJob?->next_sequence ?? $this->resumeSequence;
+
+        unset($this->order);
+
+        if (($result['status'] ?? '') === 'completed' || ($freshJob?->status ?? '') === 'completed') {
+            $this->isPrinting = false;
+            $this->checkPrinter();
+            if ($this->lastToastedJobId !== $job->id) {
+                $this->lastToastedJobId = $job->id;
+                Flux::toast(variant: 'success', text: "¡Trabajo completado! Se imprimieron {$job->total_labels} etiquetas en la Zebra.");
+            }
+            return;
+        }
+
+        if (($result['status'] ?? '') === 'paused_error' || ($freshJob?->status ?? '') === 'paused_error') {
+            $this->isPrinting = false;
+            $this->checkPrinter();
+            // El modal se queda abierto para mostrar la causa y el botón de reanudar
+        }
+    }
+
+    public function resumePrintJob(?int $jobId = null, ?int $fromSeq = null): void
+    {
+        $id = $jobId ?? $this->activeJobId;
+        if (! $id) {
+            return;
+        }
+
+        $lock = app(ZebraSessionLock::class)->getActiveLockForOther($this->printerIp, $this->printerPort, $id, session()->getId());
+        if ($lock !== null) {
+            Flux::toast(variant: 'warning', text: "La impresora está en uso por {$lock['user_name']} (Lote {$lock['lot_code']}, Trabajo #{$lock['job_id']}).");
+            return;
+        }
+
+        $job = BoxLabelPrintJob::query()->find($id);
+        if ($job) {
+            $job->printer_ip = $this->printerIp;
+            $job->printer_port = $this->printerPort;
+            $job->save();
+
+            $targetSeq = $fromSeq ?? $this->resumeSequence ?? $job->next_sequence;
+            app(ManagePrintJob::class)->resumeJob($job, (int) $targetSeq);
+            $job->refresh();
+
+            $this->activeJobId = $job->id;
+            $this->resumeSequence = $job->next_sequence;
+
+            // Intentar despausar la Zebra remotamente mediante comando ~PS
+            $zebra = app(ZebraPrintService::class);
+            $zebra->unpausePrinter($this->printerIp, $this->printerPort);
+
+            $this->isPrinting = true;
+            Flux::modal('zebra-print-monitor-modal')->show();
+            $this->processActivePrintJob();
+        }
+    }
+
+    public function pausePrintJob(?int $jobId = null): void
+    {
+        $id = $jobId ?? $this->activeJobId;
+        if (! $id) {
+            return;
+        }
+
+        $job = BoxLabelPrintJob::query()->find($id);
+        if ($job) {
+            $this->isPrinting = false;
+            app(ManagePrintJob::class)->pauseJob($job);
+            $job->refresh();
+
+            $this->activeJobId = $job->id;
+            $this->resumeSequence = $job->next_sequence;
+            $this->checkPrinter();
+            Flux::toast(variant: 'info', text: "Impresión pausada físicamente en la caja #{$job->next_sequence}.");
+        }
+    }
+
+    public function cancelPrintJob(?int $jobId = null): void
+    {
+        $id = $jobId ?? $this->activeJobId;
+        if (! $id) {
+            return;
+        }
+
+        $job = BoxLabelPrintJob::query()->find($id);
+        if ($job) {
+            $this->isPrinting = false;
+            app(ManagePrintJob::class)->cancelJob($job);
+            app(ZebraSessionLock::class)->release($this->printerIp, $this->printerPort, $job->id);
+            Flux::toast(variant: 'warning', text: "Trabajo cancelado. Quedaron {$job->pending_labels} etiquetas sin imprimir.");
+            Flux::modal('zebra-print-monitor-modal')->close();
+            $this->activeJobId = null;
+        }
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    public function getActivePrinterLock(): ?array
+    {
+        return app(ZebraSessionLock::class)->getActiveLockForOther($this->printerIp, $this->printerPort, $this->activeJobId, session()->getId());
+    }
+
+    public function forceUnlockPrinter(): void
+    {
+        app(ZebraSessionLock::class)->forceRelease($this->printerIp, $this->printerPort);
+        Flux::toast(variant: 'info', text: 'Bloqueo exclusivo de impresora liberado manualmente.');
     }
 
     private function context(): TraceContext
@@ -111,7 +313,7 @@ new #[Title('Etiquetas de caja')] class extends Component {
     #[Computed]
     public function order(): ?ProductionOrder
     {
-        return $this->orderId === null ? null : ProductionOrder::query()->with(['item', 'boxLabelBatches.generator:id,name'])->find($this->orderId);
+        return $this->orderId === null ? null : ProductionOrder::query()->with(['item', 'boxLabelBatches.generator:id,name', 'boxLabelBatches.latestPrintJob'])->find($this->orderId);
     }
 
     #[Computed]
@@ -230,27 +432,104 @@ new #[Title('Etiquetas de caja')] class extends Component {
         }
     }
 
-    public function generate(GenerateBoxLabels $generate): void
+    public function currentLastSequence(): int
+    {
+        if ($this->order === null) {
+            return 0;
+        }
+
+        $lot = $this->lot();
+        if ($lot === null) {
+            return (int) ($this->order->last_box_sequence ?? 0);
+        }
+
+        $currentRun = (int) ($this->order->current_box_run ?? 1);
+        if ($currentRun < 1) {
+            $currentRun = 1;
+        }
+
+        $maxSeq = (int) BoxLabel::query()
+            ->where('production_order_id', $this->order->id)
+            ->where('lot_code', $lot)
+            ->where('run_number', $currentRun)
+            ->max('sequence');
+
+        if ($maxSeq === 0) {
+            $maxSeq = (int) BoxLabel::query()
+                ->where('production_order_id', $this->order->id)
+                ->where('lot_code', $lot)
+                ->max('sequence');
+        }
+
+        return $maxSeq;
+    }
+
+    public function requestGenerate(): void
     {
         $this->validate([
-            'labels' => ['required', 'integer', 'min:1'],
+            'labels' => ['required', 'integer', 'min:1', 'max:3000'],
+            'productionDate' => ['required', 'date_format:Y-m-d'],
+            'expirationDate' => ['required', 'date_format:Y-m-d'],
+            'lotCode' => ['nullable', 'string', 'max:40'],
+        ], attributes: ['labels' => 'cantidad de etiquetas', 'productionDate' => 'fecha de producción', 'expirationDate' => 'fecha de vencimiento', 'lotCode' => 'lote']);
+
+        $lastSeq = $this->currentLastSequence();
+
+        // Si ya existen etiquetas generadas para este lote, mostrar modal Flux
+        // para que el operador decida si continuar consecutivo o reiniciar a #0001
+        if ($lastSeq > 0) {
+            Flux::modal('confirm-box-consecutive')->show();
+
+            return;
+        }
+
+        $this->executeGenerate(restartSequence: false);
+    }
+
+    public function executeGenerate(bool $restartSequence = false): void
+    {
+        $this->validate([
+            'labels' => ['required', 'integer', 'min:1', 'max:3000'],
             'productionDate' => ['required', 'date_format:Y-m-d'],
             'expirationDate' => ['required', 'date_format:Y-m-d'],
             'lotCode' => ['nullable', 'string', 'max:40'],
         ], attributes: ['labels' => 'cantidad de etiquetas', 'productionDate' => 'fecha de producción', 'expirationDate' => 'fecha de vencimiento', 'lotCode' => 'lote']);
 
         try {
-            $batch = $generate->handle(Auth::user(), (int) $this->orderId, $this->labels, $this->date($this->productionDate) ?? today(), $this->date($this->expirationDate), $this->context(), trim($this->lotCode) === '' ? null : $this->lotCode);
+            $batch = app(GenerateBoxLabels::class)->handle(
+                Auth::user(),
+                (int) $this->orderId,
+                $this->labels,
+                $this->date($this->productionDate) ?? today(),
+                $this->date($this->expirationDate),
+                $this->context(),
+                trim($this->lotCode) === '' ? null : $this->lotCode,
+                $restartSequence,
+            );
         } catch (BoxLabelRuleViolation $e) {
             Flux::toast(variant: 'danger', text: $e->getMessage());
+            Flux::modal('confirm-box-consecutive')->close();
 
             return;
         }
 
+        Flux::modal('confirm-box-consecutive')->close();
+
         $this->batchId = $batch->id;
         $this->lotCode = '';
         unset($this->order, $this->batch);
-        Flux::toast(variant: 'success', text: "{$batch->labels} etiquetas generadas. Lista para imprimir en Zebra o descargar ZPL.");
+
+        $rangeInfo = "Cajas #{$batch->first_sequence} a #{$batch->last_sequence}";
+        if ($batch->is_reset) {
+            $rangeInfo .= ' (Consecutivo reiniciado a #1)';
+        }
+
+        Flux::toast(variant: 'success', text: "{$batch->labels} etiquetas generadas ({$rangeInfo}). Lista para imprimir en Zebra o descargar ZPL.");
+    }
+
+    public function generate(bool $restartSequence = false): void
+    {
+        $this->executeGenerate($restartSequence);
     }
 }; ?>
 
@@ -259,10 +538,12 @@ new #[Title('Etiquetas de caja')] class extends Component {
     $preview = $this->preview();
     $max = $this->maxLabels();
     $printed = $this->printedLabels();
+    $lastSeq = $this->currentLastSequence();
     $tz = config('app.timezone');
     // The first label: its printed text (with its box code) and its QR, which carries only the box token.
     $boxes = $this->batch === null ? collect() : BoxLabel::query()->where('box_label_batch_id', $this->batch->id)->orderBy('sequence')->get(['code', 'qr_token']);
-    $nextBox = $preview === null ? null : BoxLot::boxCode($preview->lotCode, (int) BoxLabel::query()->where('production_order_id', $order->id)->where('lot_code', $preview->lotCode)->max('sequence') + 1);
+    $nextBoxSeq = $lastSeq > 0 ? $lastSeq + 1 : 1;
+    $nextBox = $preview === null ? null : BoxLot::boxCode($preview->lotCode, $nextBoxSeq);
     $shownPayload = $this->batch !== null
         ? $this->batch->qr_payload.($boxes->isEmpty() ? '' : "\nCaja: ".$boxes->first()->code)
         : $preview?->withBox((string) $nextBox)->encode();
@@ -286,7 +567,7 @@ new #[Title('Etiquetas de caja')] class extends Component {
             <flux:subheading>QR para las cajas de producto. Formato exacto 10 × 8 cm para impresora Zebra (ZPL)</flux:subheading>
         </div>
 
-        {{-- Estado en tiempo real de la Zebra --}}
+        {{-- Estado en tiempo real de la Zebra y control de velocidad --}}
         <div class="flex items-center gap-2 rounded-lg border border-zinc-200 bg-white px-3 py-1.5 shadow-sm dark:border-zinc-700 dark:bg-zinc-800">
             @if ($printerStatus && ($printerStatus['online'] ?? false))
                 <span class="inline-block h-2.5 w-2.5 rounded-full bg-emerald-500 animate-pulse"></span>
@@ -299,6 +580,13 @@ new #[Title('Etiquetas de caja')] class extends Component {
                     Zebra ({{ $printerIp }}): <strong class="text-rose-600 dark:text-rose-400">{{ $printerStatus['status_label'] ?? 'Sin conexión' }}</strong>
                 </span>
             @endif
+
+            <flux:modal.trigger name="zebra-speed-modal">
+                <flux:button size="xs" variant="filled" icon="adjustments-horizontal" title="Ajustar velocidad de impresión">
+                    Velocidad: {{ $printSpeed }} ips
+                </flux:button>
+            </flux:modal.trigger>
+
             <flux:button size="xs" variant="ghost" icon="arrow-path" wire:click="checkPrinter" wire:loading.attr="disabled" wire:target="checkPrinter">
                 Verificar
             </flux:button>
@@ -358,13 +646,22 @@ new #[Title('Etiquetas de caja')] class extends Component {
                     </dd>
                     <dt class="text-zinc-500">Etiquetas generadas</dt>
                     <dd class="font-medium tabular-nums">{{ $printed }}</dd>
+                    <dt class="text-zinc-500">Último consecutivo en BD</dt>
+                    <dd class="font-medium tabular-nums">
+                        @if ($lastSeq > 0)
+                            <span class="font-mono text-emerald-600 dark:text-emerald-400 font-semibold">Caja #{{ $lastSeq }}</span>
+                            <span class="text-xs text-zinc-500">(próxima: #{{ $lastSeq + 1 }})</span>
+                        @else
+                            <span class="text-zinc-500">Sin cajas generadas aún</span>
+                        @endif
+                    </dd>
                     <dt class="text-zinc-500">Sugeridas por la OF</dt>
                     <dd class="font-medium tabular-nums">{{ $max ?? '—' }} <span class="text-xs font-normal text-zinc-500">(se puede generar más)</span></dd>
                 </dl>
 
-                <form wire:submit="generate" class="flex flex-col gap-4">
+                <form wire:submit="requestGenerate" class="flex flex-col gap-4">
                     <div class="grid gap-4 sm:grid-cols-3">
-                        <flux:input wire:model.live.debounce.400ms="labels" type="number" min="1" label="Cantidad de etiquetas" required />
+                        <flux:input wire:model.live.debounce.400ms="labels" type="number" min="1" max="3000" label="Cantidad de etiquetas (máx 3.000)" required />
                         <flux:input wire:model.live="productionDate" type="date" label="Fecha de producción" required />
                         <flux:input wire:model.live="expirationDate" type="date" label="Fecha de vencimiento" required />
                     </div>
@@ -385,8 +682,7 @@ new #[Title('Etiquetas de caja')] class extends Component {
                     @if ($over > 0)
                         <flux:callout variant="warning" icon="exclamation-triangle" heading="Supera lo sugerido por la OF en {{ $over }} etiquetas" text="Se permite para reponer etiquetas mal impresas o cajas averiadas. Queda registrado." />
                     @endif
-                    <flux:button type="submit" variant="primary" icon="qr-code" wire:loading.attr="disabled" wire:target="generate"
-                        wire:confirm="¿Generar {{ $labels }} etiquetas de caja para la OF {{ $order->ref }} con el lote {{ $this->lot() }}?{{ $over > 0 ? ' Supera en '.$over.' las sugeridas por la OF.' : '' }}">Generar etiquetas</flux:button>
+                    <flux:button type="submit" variant="primary" icon="qr-code" wire:loading.attr="disabled" wire:target="requestGenerate, executeGenerate">Generar etiquetas</flux:button>
                 </form>
             </div>
 
@@ -509,30 +805,82 @@ new #[Title('Etiquetas de caja')] class extends Component {
 
         @if ($order->boxLabelBatches->isNotEmpty())
             @php($prints = BoxLabelPrint::query()->where('production_order_id', $order->id)->selectRaw('box_label_batch_id, count(*) as n')->groupBy('box_label_batch_id')->pluck('n', 'box_label_batch_id')->map(fn ($n) => (int) $n)->all())
+            @php($printerLock = $this->getActivePrinterLock())
             <div>
+                @if ($printerLock)
+                    <div class="mb-4 flex items-center justify-between rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/60 dark:text-amber-200">
+                        <div class="flex items-center gap-2">
+                            <flux:icon icon="lock-closed" class="size-5 text-amber-600 dark:text-amber-400 shrink-0" />
+                            <div>
+                                <strong>Impresora Zebra en uso exclusivo:</strong> {{ $printerLock['user_name'] }} está imprimiendo el lote <code class="font-mono font-bold">{{ $printerLock['lot_code'] }}</code> (Trabajo #{{ $printerLock['job_id'] }}). Por control de búfer, no se permiten impresiones concurrentes.
+                            </div>
+                        </div>
+                        <flux:button size="xs" variant="ghost" wire:click="forceUnlockPrinter" class="text-amber-700 hover:text-amber-900 dark:text-amber-300">Liberar bloqueo</flux:button>
+                    </div>
+                @endif
                 <flux:heading size="lg" level="2" class="mb-3">Etiquetas generadas para esta orden</flux:heading>
                 <flux:table>
                     <flux:table.columns>
                         <flux:table.column>Generadas</flux:table.column>
                         <flux:table.column>Lote</flux:table.column>
+                        <flux:table.column>Rango de cajas</flux:table.column>
                         <flux:table.column>Vence</flux:table.column>
                         <flux:table.column align="end">Etiquetas</flux:table.column>
                         <flux:table.column>Por</flux:table.column>
-                        <flux:table.column align="end">Impresa en Zebra</flux:table.column>
+                        <flux:table.column align="end">Estado Impresión</flux:table.column>
                         <flux:table.column align="end"><span class="sr-only">Acciones</span></flux:table.column>
                     </flux:table.columns>
                     <flux:table.rows>
                         @foreach ($order->boxLabelBatches->sortByDesc('id') as $b)
+                            @php($job = $b->latestPrintJob)
                             <flux:table.row :key="$b->id">
                                 <flux:table.cell class="whitespace-nowrap text-xs tabular-nums">{{ $b->generated_at->timezone($tz)->format('d/m/Y H:i') }}</flux:table.cell>
                                 <flux:table.cell class="font-mono">{{ $b->lot_code }}</flux:table.cell>
+                                <flux:table.cell class="whitespace-nowrap font-mono text-xs">
+                                    #{{ $b->first_sequence }} - #{{ $b->last_sequence }}
+                                    @if ($b->is_reset)
+                                        <flux:badge color="amber" size="sm" class="ml-1">Reinicio (C{{ $b->run_number }})</flux:badge>
+                                    @endif
+                                </flux:table.cell>
                                 <flux:table.cell>{{ $b->expiration_date->format('d/m/Y') }}</flux:table.cell>
-                                <flux:table.cell align="end" class="tabular-nums">{{ $b->labels }}</flux:table.cell>
+                                <flux:table.cell align="end" class="tabular-nums font-semibold">{{ $b->labels }}</flux:table.cell>
                                 <flux:table.cell>{{ $b->generator->name }}</flux:table.cell>
-                                <flux:table.cell align="end" class="tabular-nums">{{ ($prints[$b->id] ?? 0) === 0 ? 'No' : $prints[$b->id].' '.(($prints[$b->id] ?? 0) === 1 ? 'vez' : 'veces') }}</flux:table.cell>
+                                <flux:table.cell align="end">
+                                    @if ($job && in_array($job->status, ['paused_error', 'cancelled'], true) && $job->pending_labels > 0)
+                                        <div class="flex items-center justify-end gap-1">
+                                            <flux:badge color="rose" size="sm" icon="exclamation-circle" title="{{ $job->error_reason ?? 'Pausada' }}">
+                                                Pausada ({{ $job->printed_labels }}/{{ $job->total_labels }})
+                                            </flux:badge>
+                                        </div>
+                                    @elseif ($job && $job->status === 'printing')
+                                        <div class="flex items-center justify-end gap-1">
+                                            <flux:badge color="blue" size="sm" icon="arrow-path" class="animate-pulse">
+                                                Imprimiendo ({{ $job->printed_labels }}/{{ $job->total_labels }})
+                                            </flux:badge>
+                                        </div>
+                                    @elseif (($prints[$b->id] ?? 0) > 0 || ($job && $job->status === 'completed'))
+                                        <flux:badge color="emerald" size="sm" icon="check">
+                                            {{ ($prints[$b->id] ?? 0) > 1 ? $prints[$b->id].' veces' : 'Impresa' }}
+                                        </flux:badge>
+                                    @else
+                                        <span class="text-xs text-zinc-400">Sin imprimir</span>
+                                    @endif
+                                </flux:table.cell>
                                 <flux:table.cell align="end">
                                     <div class="flex items-center justify-end gap-1">
-                                        <flux:button size="sm" variant="ghost" icon="printer" wire:click="printBatchDirect({{ $b->id }})" title="Imprimir directo en Zebra">Imprimir</flux:button>
+                                        @if ($job && in_array($job->status, ['paused_error', 'cancelled'], true) && $job->pending_labels > 0)
+                                            @if ($printerLock && ($printerLock['job_id'] ?? null) !== $job->id)
+                                                <flux:button size="sm" variant="ghost" disabled icon="lock-closed" title="Impresora ocupada por {{ $printerLock['user_name'] }}">En uso</flux:button>
+                                            @else
+                                                <flux:button size="sm" variant="danger" icon="play" wire:click="resumePrintJob({{ $job->id }})" title="Reanudar desde caja #{{ $job->next_sequence }}">Reanudar #{{ $job->next_sequence }}</flux:button>
+                                            @endif
+                                        @elseif ($job && $job->status === 'printing')
+                                            <flux:button size="sm" variant="subtle" icon="arrow-path" wire:click="openJobMonitor({{ $job->id }})" title="Ver progreso de impresión">Monitorear</flux:button>
+                                        @elseif ($printerLock)
+                                            <flux:button size="sm" variant="ghost" disabled icon="lock-closed" title="Impresora ocupada por {{ $printerLock['user_name'] }}">En uso</flux:button>
+                                        @else
+                                            <flux:button size="sm" variant="ghost" icon="printer" wire:click="printBatchDirect({{ $b->id }})" title="Imprimir directo en Zebra">Imprimir</flux:button>
+                                        @endif
                                         <flux:button size="sm" variant="ghost" icon="arrow-down-tray" :href="route('box-labels.zpl', $b)">ZPL</flux:button>
                                     </div>
                                 </flux:table.cell>
@@ -542,5 +890,253 @@ new #[Title('Etiquetas de caja')] class extends Component {
                 </flux:table>
             </div>
         @endif
+
+        {{-- Modal de control y decisión de consecutivo de cajas (Flux) --}}
+        <flux:modal name="confirm-box-consecutive" class="w-full max-w-lg">
+            <div class="flex flex-col gap-4">
+                <div class="flex items-start gap-3">
+                    <div class="rounded-full bg-amber-100 p-2 text-amber-600 dark:bg-amber-950/60 dark:text-amber-400">
+                        <flux:icon icon="exclamation-triangle" class="size-6" />
+                    </div>
+                    <div>
+                        <flux:heading size="lg">Control de consecutivo de cajas</flux:heading>
+                        <flux:subheading>
+                            Esta orden ya tiene <strong class="text-zinc-900 dark:text-white">{{ $lastSeq }}</strong> etiquetas generadas para el lote <strong class="font-mono text-zinc-900 dark:text-white">{{ $this->lot() }}</strong>.
+                        </flux:subheading>
+                    </div>
+                </div>
+
+                <div class="rounded-lg border border-zinc-200 bg-zinc-50 p-4 text-sm space-y-3 dark:border-zinc-700 dark:bg-zinc-800/60">
+                    <div class="text-zinc-700 dark:text-zinc-200">
+                        Vas a generar <strong class="text-zinc-900 dark:text-white">{{ $labels }}</strong> etiquetas nuevas. Elige cómo deseas continuar la numeración:
+                    </div>
+
+                    {{-- Opción 1: Continuar consecutivo --}}
+                    <div class="rounded-lg border border-emerald-300 bg-white p-3.5 shadow-sm dark:border-emerald-700/60 dark:bg-zinc-900 flex flex-col gap-2">
+                        <div class="flex items-center justify-between">
+                            <span class="font-semibold text-emerald-700 dark:text-emerald-400 flex items-center gap-1.5">
+                                <flux:icon icon="arrow-right-circle" class="size-4" />
+                                Continuar consecutivo (Faltantes)
+                            </span>
+                            <flux:badge color="green" size="sm">Recomendado</flux:badge>
+                        </div>
+                        <p class="text-xs text-zinc-600 dark:text-zinc-400 leading-relaxed">
+                            Continúa la secuencia donde quedó. Generará las cajas desde la <strong>#{{ $lastSeq + 1 }}</strong> hasta la <strong>#{{ $lastSeq + (int) $labels }}</strong>
+                            @if ($preview !== null)
+                                (ej. <code class="font-mono text-emerald-600 dark:text-emerald-400">{{ BoxLot::boxCode((string) $preview->lotCode, $lastSeq + 1) }}</code>).
+                            @endif
+                        </p>
+                        <div class="pt-1">
+                            <flux:button variant="primary" class="w-full justify-center" icon="arrow-right-circle" wire:click="executeGenerate(false)" wire:loading.attr="disabled" wire:target="executeGenerate">
+                                Continuar desde Caja #{{ $lastSeq + 1 }} (hasta #{{ $lastSeq + (int) $labels }})
+                            </flux:button>
+                        </div>
+                    </div>
+
+                    {{-- Opción 2: Reiniciar consecutivo --}}
+                    <div class="rounded-lg border border-amber-300 bg-white p-3.5 shadow-sm dark:border-amber-700/60 dark:bg-zinc-900 flex flex-col gap-2">
+                        <div class="flex items-center justify-between">
+                            <span class="font-semibold text-amber-700 dark:text-amber-400 flex items-center gap-1.5">
+                                <flux:icon icon="arrow-path" class="size-4" />
+                                Reiniciar consecutivo
+                            </span>
+                            <flux:badge color="amber" size="sm">Nueva corrida</flux:badge>
+                        </div>
+                        <p class="text-xs text-zinc-600 dark:text-zinc-400 leading-relaxed">
+                            Empieza una nueva numeración desde la <strong>Caja - 0001</strong> hasta la <strong>#{{ (int) $labels }}</strong>
+                            @if ($preview !== null)
+                                (ej. <code class="font-mono text-amber-600 dark:text-amber-400">{{ BoxLot::boxCode((string) $preview->lotCode, 1) }}</code>).
+                            @endif
+                            Se registrará como una corrida nueva en el historial para no mezclar las cajas.
+                        </p>
+                        <div class="pt-1">
+                            <flux:button variant="filled" class="w-full justify-center text-amber-700 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-950/40" icon="arrow-path" wire:click="executeGenerate(true)" wire:loading.attr="disabled" wire:target="executeGenerate">
+                                Empezar desde Caja - 0001 (hasta #{{ (int) $labels }})
+                            </flux:button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="flex justify-end gap-2">
+                    <flux:modal.close>
+                        <flux:button variant="ghost">Cancelar</flux:button>
+                    </flux:modal.close>
+                </div>
+            </div>
+        </flux:modal>
     @endif
+
+    {{-- Modal para regular la velocidad de la impresora Zebra (Flux) --}}
+    <flux:modal name="zebra-speed-modal" class="w-full max-w-md">
+        <div class="flex flex-col gap-4">
+            <div class="flex items-start gap-3">
+                <div class="rounded-full bg-indigo-100 p-2 text-indigo-600 dark:bg-indigo-950/60 dark:text-indigo-400">
+                    <flux:icon icon="bolt" class="size-6" />
+                </div>
+                <div>
+                    <flux:heading size="lg">Velocidad de impresión Zebra</flux:heading>
+                    <flux:subheading>
+                        Regula la velocidad en pulgadas por segundo (IPS) para la Zebra ZT411 ({{ $printerIp }}). El cambio se guarda inmediatamente.
+                    </flux:subheading>
+                </div>
+            </div>
+
+            <div class="rounded-lg border border-zinc-200 bg-zinc-50 p-4 text-sm space-y-3 dark:border-zinc-700 dark:bg-zinc-800/60">
+                <div class="flex items-center justify-between">
+                    <span class="text-zinc-700 dark:text-zinc-200 font-medium">Velocidad activa:</span>
+                    <flux:badge color="indigo" size="lg" class="font-bold">{{ $printSpeed }} ips (~{{ round($printSpeed * 25.4) }} mm/s)</flux:badge>
+                </div>
+
+                <div class="text-xs text-zinc-500">Selecciona una velocidad rápida predefinida:</div>
+
+                <div class="grid grid-cols-2 gap-2">
+                    @foreach ([
+                        3 => ['label' => '3 IPS', 'desc' => 'Muy lenta (~76 mm/s)'],
+                        4 => ['label' => '4 IPS', 'desc' => 'Moderada (~102 mm/s)'],
+                        6 => ['label' => '6 IPS', 'desc' => 'Recomendada (~152 mm/s)'],
+                        8 => ['label' => '8 IPS', 'desc' => 'Rápida (~203 mm/s)'],
+                        10 => ['label' => '10 IPS', 'desc' => 'Muy rápida (~254 mm/s)'],
+                        12 => ['label' => '12 IPS', 'desc' => 'Máxima (~305 mm/s)'],
+                    ] as $spd => $info)
+                        <button type="button" wire:click="setZebraSpeed({{ $spd }})"
+                            class="flex flex-col items-start p-2.5 rounded-lg border text-left transition-all {{ $printSpeed === $spd ? 'border-indigo-600 bg-indigo-50 dark:border-indigo-400 dark:bg-indigo-950/40 text-indigo-900 dark:text-indigo-200 ring-2 ring-indigo-500/30' : 'border-zinc-200 bg-white hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:bg-zinc-800 text-zinc-800 dark:text-zinc-200' }}">
+                            <div class="flex items-center justify-between w-full">
+                                <span class="font-bold text-sm">{{ $info['label'] }}</span>
+                                @if ($printSpeed === $spd)
+                                    <flux:icon icon="check" class="size-4 text-indigo-600 dark:text-indigo-400" />
+                                @endif
+                            </div>
+                            <span class="text-[11px] text-zinc-500 dark:text-zinc-400 leading-tight mt-0.5">{{ $info['desc'] }}</span>
+                        </button>
+                    @endforeach
+                </div>
+
+                <div class="pt-2 border-t border-zinc-200 dark:border-zinc-700">
+                    <div class="flex items-end gap-2">
+                        <div class="flex-1">
+                            <flux:input wire:model="printSpeed" type="number" min="2" max="14" label="O ingresa un valor exacto (2 a 14 IPS)" />
+                        </div>
+                        <flux:button type="button" variant="primary" wire:click="setZebraSpeed($wire.printSpeed)">Guardar</flux:button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="flex justify-end gap-2">
+                <flux:modal.close>
+                    <flux:button variant="ghost">Cerrar</flux:button>
+                </flux:modal.close>
+            </div>
+        </div>
+    </flux:modal>
+
+    {{-- Modal interactivo de monitoreo de impresión por sub-lotes y detección física (Flux) --}}
+    <flux:modal name="zebra-print-monitor-modal" class="w-full max-w-lg">
+        @php($job = $this->activeJob)
+        @if ($job)
+            <div class="flex flex-col gap-4" @if ($isPrinting && $job && $job->status === 'printing') wire:poll.200ms="processActivePrintJob" @endif>
+                <div class="flex items-start justify-between">
+                    <div>
+                        <flux:heading size="lg">Monitor de Impresión Zebra ZT411</flux:heading>
+                        <flux:subheading>Lote: <span class="font-mono font-medium text-zinc-900 dark:text-white">{{ $job->lot_code }}</span> · Orden #{{ $job->production_order_id }}</flux:subheading>
+                    </div>
+                    <div>
+                        @if ($job->status === 'completed')
+                            <flux:badge color="emerald" size="lg" icon="check-circle">Completado</flux:badge>
+                        @elseif ($job->status === 'paused_error')
+                            <flux:badge color="amber" size="lg" icon="pause-circle">Pausada ({{ $job->printed_labels }}/{{ $job->total_labels }})</flux:badge>
+                        @elseif ($job->status === 'printing')
+                            <flux:badge color="blue" size="lg" icon="arrow-path" class="animate-pulse">Imprimiendo ({{ $job->printed_labels }}/{{ $job->total_labels }})...</flux:badge>
+                        @else
+                            <flux:badge color="zinc" size="lg">{{ ucfirst($job->status) }}</flux:badge>
+                        @endif
+                    </div>
+                </div>
+
+                {{-- Barra de Progreso Físico --}}
+                <div class="space-y-1.5">
+                    <div class="flex justify-between text-xs font-medium">
+                        <span>Avance físico: <strong>{{ $job->printed_labels }}</strong> de <strong>{{ $job->total_labels }}</strong> etiquetas</span>
+                        <span class="font-bold">{{ $job->progressPercent() }}%</span>
+                    </div>
+                    <div class="w-full bg-zinc-200 dark:bg-zinc-800 rounded-full h-3 overflow-hidden">
+                        <div class="h-3 rounded-full transition-all duration-300 {{ $job->status === 'paused_error' ? 'bg-amber-500' : ($job->status === 'completed' ? 'bg-emerald-500' : 'bg-blue-600') }}"
+                             style="width: {{ $job->progressPercent() }}%"></div>
+                    </div>
+                </div>
+
+                {{-- Detalle de Consecutivo y Sub-lotes --}}
+                <div class="grid grid-cols-2 gap-2 text-xs bg-zinc-50 dark:bg-zinc-900/60 p-3 rounded-lg border border-zinc-200 dark:border-zinc-800">
+                    <div>
+                        <span class="text-zinc-500">Última caja impresa:</span>
+                        <div class="font-mono font-semibold text-zinc-900 dark:text-white text-sm">
+                            {{ $job->last_printed_sequence > 0 ? '#'.str_pad((string)$job->last_printed_sequence, 4, '0', STR_PAD_LEFT) : 'Ninguna aún' }}
+                        </div>
+                    </div>
+                    <div>
+                        <span class="text-zinc-500">Siguiente caja a imprimir:</span>
+                        <div class="font-mono font-semibold text-blue-600 dark:text-blue-400 text-sm">
+                            {{ $job->pending_labels > 0 ? '#'.str_pad((string)($resumeSequence ?? $job->next_sequence), 4, '0', STR_PAD_LEFT) : '—' }}
+                        </div>
+                    </div>
+                </div>
+
+                {{-- Alerta de error físico si ocurrió --}}
+                @if ($job->status === 'paused_error')
+                    <div class="p-3.5 rounded-lg bg-amber-50 border border-amber-200 text-amber-900 dark:bg-amber-950/40 dark:border-amber-900 dark:text-amber-200 text-sm space-y-1.5">
+                        <div class="font-semibold flex items-center gap-1.5">
+                            <flux:icon icon="exclamation-triangle" class="size-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                            <span>Impresión detenida: {{ $job->error_reason ?? 'Error físico o pausa en la impresora' }}</span>
+                        </div>
+                        <p class="text-xs text-amber-800 dark:text-amber-300 leading-relaxed">
+                            La Zebra se detuvo de forma segura sin perder la cuenta física. Se imprimieron <strong>{{ $job->printed_labels }}</strong> de <strong>{{ $job->total_labels }}</strong> etiquetas (quedan <strong>{{ $job->pending_labels }}</strong> pendientes). Despause la máquina en su panel frontal o corrija el rollo/cabezal y presione <strong>Reanudar</strong> para continuar exactamente en la <strong>Caja #{{ str_pad((string)($resumeSequence ?? $job->next_sequence), 4, '0', STR_PAD_LEFT) }}</strong>.
+                        </p>
+                    </div>
+                @endif
+
+                @if ($job->status === 'completed')
+                    <div class="p-3.5 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800 dark:bg-emerald-950/40 dark:border-emerald-900 dark:text-emerald-200 text-sm">
+                        <div class="font-semibold flex items-center gap-1.5">
+                            <flux:icon icon="check-circle" class="size-4 text-emerald-600 dark:text-emerald-400" />
+                            <span>¡Todas las {{ $job->total_labels }} etiquetas fueron impresas exitosamente!</span>
+                        </div>
+                    </div>
+                @endif
+
+                <div class="flex items-center justify-between pt-2">
+                    @if ($job->status === 'paused_error')
+                        <div class="flex flex-col gap-2.5 w-full">
+                            <div class="flex items-end gap-2">
+                                <div class="w-36">
+                                    <flux:input wire:model.live="resumeSequence" type="number" min="{{ $job->start_sequence }}" max="{{ $job->end_sequence }}" label="Desde Caja #" />
+                                </div>
+                                <div class="flex-1">
+                                    <flux:button variant="danger" icon="play" class="w-full" wire:click="resumePrintJob({{ $job->id }})">
+                                        Reanudar desde Caja #{{ str_pad((string)($resumeSequence ?? $job->next_sequence), 4, '0', STR_PAD_LEFT) }} ({{ max(1, $job->end_sequence - (int)($resumeSequence ?? $job->next_sequence) + 1) }} pendientes)
+                                    </flux:button>
+                                </div>
+                            </div>
+                            <div class="flex justify-end">
+                                <flux:button variant="ghost" size="sm" wire:click="cancelPrintJob({{ $job->id }})">Cancelar etiquetas restantes</flux:button>
+                            </div>
+                        </div>
+                    @elseif ($job->status === 'printing')
+                        <div class="flex items-center gap-2 text-xs text-zinc-500">
+                            <flux:icon icon="arrow-path" class="size-4 animate-spin text-blue-500" />
+                            <span>Imprimiendo de forma granular (1 a 1)...</span>
+                        </div>
+                        <flux:button variant="ghost" size="sm" wire:click="pausePrintJob({{ $job->id }})">Pausar</flux:button>
+                    @else
+                        <flux:spacer />
+                        <flux:modal.close>
+                            <flux:button variant="primary">Aceptar</flux:button>
+                        </flux:modal.close>
+                    @endif
+                </div>
+            </div>
+        @else
+            <div class="p-4 text-center text-zinc-500">
+                No hay ningún trabajo de impresión activo seleccionado.
+            </div>
+        @endif
+    </flux:modal>
 </section>

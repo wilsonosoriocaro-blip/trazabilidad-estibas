@@ -6,6 +6,7 @@ use App\Domain\Pallets\Enums\PhysicalStatus;
 use App\Enums\Role;
 use App\Models\Pallet;
 use App\Models\PalletCloseReason;
+use App\Models\PalletLabelPrint;
 use App\Models\PalletScanEvent;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -113,7 +114,8 @@ class ProductionStationTest extends TestCase
         $station = Livewire::actingAs($this->operator)->test('pages::production.station')->call('palletize', $pallet->id);
         $this->assertSame(PhysicalStatus::Palletized, $pallet->refresh()->physical_status);
 
-        $station->call('printLabel', $pallet->id)->assertRedirect(route('pallets.label', ['pallet' => $pallet->id, 'print' => 1]));
+        $station->call('printLabel', $pallet->id);
+        $this->assertSame(1, PalletLabelPrint::query()->where('pallet_id', $pallet->id)->count());
     }
 
     public function test_reprint_from_the_station_requires_a_reason(): void
@@ -122,7 +124,8 @@ class ProductionStationTest extends TestCase
         $station = Livewire::actingAs($this->operator)->test('pages::production.station')->call('printLabel', $pallet->id);
 
         $station->call('askReprint', $pallet->id)->set('reprintReason', '')->call('reprint')->assertHasErrors(['reprintReason' => 'required']);
-        $station->set('reprintReason', 'Se mojó')->call('reprint')->assertRedirect(route('pallets.label', ['pallet' => $pallet->id, 'print' => 2]));
+        $station->set('reprintReason', 'Se mojó')->call('reprint');
+        $this->assertSame(2, PalletLabelPrint::query()->where('pallet_id', $pallet->id)->count());
     }
 
     public function test_it_says_when_label_confirmation_and_scan_ingestion_are_pending(): void

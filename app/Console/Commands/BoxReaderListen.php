@@ -7,6 +7,7 @@ use App\Domain\Pallets\Actions\RegisterManualBoxScan;
 use App\Domain\Pallets\Readers\BoxReaderSession;
 use App\Domain\Pallets\Readers\BoxReadOutcome;
 use App\Models\Device;
+use App\Services\DatalogicDebugService;
 use App\Services\TraceLogger;
 use Illuminate\Console\Attributes\Description;
 use Illuminate\Console\Attributes\Signature;
@@ -87,7 +88,7 @@ class BoxReaderListen extends Command
             if ($stream !== null) {
                 $this->info("Lector {$code} conectado.");
                 $backoff = 1;
-                $this->pump($stream, new BoxReaderSession($reader, $scan, $trace), $code, $mode === 'serial' ? 0 : max(0, (int) $this->option('idle-minutes')));
+                $this->pump($stream, new BoxReaderSession($reader, $scan, $trace), $code, $target, $mode === 'serial' ? 0 : max(0, (int) $this->option('idle-minutes')));
                 fclose($stream);
                 $this->warn("Lector {$code} desconectado.");
             } elseif ($mode === 'listen' && ! $this->option('once')) {
@@ -109,8 +110,9 @@ class BoxReaderListen extends Command
     /**
      * @param  resource  $stream
      */
-    private function pump($stream, BoxReaderSession $session, string $code, int $idleMinutes): void
+    private function pump($stream, BoxReaderSession $session, string $code, string $remote, int $idleMinutes): void
     {
+        $debug = app(DatalogicDebugService::class);
         Heartbeat::record(Heartbeat::reader($code));
         $lastData = time();
 
@@ -138,11 +140,14 @@ class BoxReaderListen extends Command
                 return;
             }
 
+            $debug->recordTcpChunk($code, $remote, $chunk);
+
             foreach ($session->feed($chunk) as $box) {
+                $time = date('H:i:s');
                 if ($box->outcome === BoxReadOutcome::Rejected) {
-                    $this->warn('No contada: '.$box->message);
+                    $this->warn("[{$time}] No contada: {$box->message}");
                 } else {
-                    $this->line(($box->outcome === BoxReadOutcome::Counted ? 'Contada: ' : 'Repetida: ').$box->message);
+                    $this->line("[{$time}] ".($box->outcome === BoxReadOutcome::Counted ? 'Contada: ' : 'Repetida: ').$box->message);
                 }
             }
         }

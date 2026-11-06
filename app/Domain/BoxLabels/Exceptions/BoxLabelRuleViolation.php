@@ -56,6 +56,11 @@ class BoxLabelRuleViolation extends DomainException
         return new self('La cantidad de etiquetas debe ser al menos 1.');
     }
 
+    public static function quantityExceedsMaximum(int $max): self
+    {
+        return new self("La cantidad máxima permitida por solicitud es de {$max} etiquetas.");
+    }
+
     public static function lotChangeNotAllowed(): self
     {
         return new self('Solo un supervisor puede cambiar el lote de las etiquetas.');

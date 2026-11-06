@@ -38,6 +38,9 @@ class ProductionOrder extends Model
             'consulted_at' => 'datetime',
             'ready_to_close_notified_at' => 'datetime',
             'sap_closed_at' => 'datetime',
+            'last_box_sequence' => 'integer',
+            'current_box_run' => 'integer',
+            'last_box_labels_at' => 'datetime',
         ];
     }
 

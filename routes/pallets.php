@@ -36,5 +36,15 @@ Route::middleware(['auth', 'verified'])->group(function () {
             ->middleware('can:pallets.label')
             ->whereNumber(['pallet', 'print'])
             ->name('label');
+
+        Route::get('{pallet}/labels/{print}/zpl', [PalletLabelController::class, 'zpl'])
+            ->middleware('can:pallets.label')
+            ->whereNumber(['pallet', 'print'])
+            ->name('label.zpl');
+
+        Route::post('{pallet}/labels/{print}/print-direct', [PalletLabelController::class, 'printDirect'])
+            ->middleware('can:pallets.label')
+            ->whereNumber(['pallet', 'print'])
+            ->name('label.print-direct');
     });
 });

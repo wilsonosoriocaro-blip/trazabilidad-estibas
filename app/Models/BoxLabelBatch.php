@@ -7,6 +7,8 @@ use Database\Factories\BoxLabelBatchFactory;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 
 /**
  * One generated set of box labels: all identical, for one production
@@ -48,6 +50,10 @@ class BoxLabelBatch extends Model
             'expiration_date' => 'immutable_date',
             'generated_at' => 'datetime',
             'labels' => 'integer',
+            'first_sequence' => 'integer',
+            'last_sequence' => 'integer',
+            'run_number' => 'integer',
+            'is_reset' => 'boolean',
         ];
     }
 
@@ -65,5 +71,37 @@ class BoxLabelBatch extends Model
     public function generator(): BelongsTo
     {
         return $this->belongsTo(User::class, 'generated_by');
+    }
+
+    /**
+     * @return HasMany<BoxLabel, $this>
+     */
+    public function boxLabels(): HasMany
+    {
+        return $this->hasMany(BoxLabel::class, 'box_label_batch_id');
+    }
+
+    /**
+     * @return HasMany<BoxLabelPrint, $this>
+     */
+    public function prints(): HasMany
+    {
+        return $this->hasMany(BoxLabelPrint::class, 'box_label_batch_id');
+    }
+
+    /**
+     * @return HasMany<BoxLabelPrintJob, $this>
+     */
+    public function printJobs(): HasMany
+    {
+        return $this->hasMany(BoxLabelPrintJob::class, 'box_label_batch_id');
+    }
+
+    /**
+     * @return HasOne<BoxLabelPrintJob, $this>
+     */
+    public function latestPrintJob(): HasOne
+    {
+        return $this->hasOne(BoxLabelPrintJob::class, 'box_label_batch_id')->latestOfMany();
     }
 }

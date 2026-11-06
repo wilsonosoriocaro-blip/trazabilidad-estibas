@@ -230,10 +230,10 @@ class BoxLabelsTest extends TestCase
         $this->assertStringContainsString('^LL640', $batch->zpl);
         $this->assertStringContainsString('^CI28', $batch->zpl);
         // The QR carries only the box token (like the pallet QR).
-        $this->assertStringContainsString('^BQN,2,6^FH_^FDMA,'.$first.'^FS', $batch->zpl);
+        $this->assertStringContainsString('^BQN,2,5^FH_^FDMA,'.$first.'^FS', $batch->zpl);
         $this->assertStringNotContainsString('^FDMA,OF 33128', $batch->zpl);
         // EAN-14 as ITF-14: check digit already in the data, (01) and the digits underneath, no bearer-bar box.
-        $this->assertStringContainsString('^B2N,150,N,N,N^FD'.$batch->barcode.'^FS', $batch->zpl);
+        $this->assertStringContainsString('^B2N,90,N,N,N^FD'.$batch->barcode.'^FS', $batch->zpl);
         $this->assertSame(0, substr_count($batch->zpl, '^GB'), 'Sin recuadro alrededor del código');
         $this->assertStringContainsString('^FD(01)'.$batch->barcode.'^FS', $batch->zpl);
         $this->assertStringContainsString('^FDGELATINA OLIMPICA SIN SABOR 30 GR^FS', $batch->zpl);

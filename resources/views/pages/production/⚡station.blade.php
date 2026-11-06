@@ -10,6 +10,8 @@ use App\Domain\Pallets\Enums\PhysicalStatus;
 use App\Domain\Pallets\Enums\ScanEventStatus;
 use App\Domain\Pallets\Enums\ScanRejection;
 use App\Domain\Pallets\Exceptions\PalletRuleViolation;
+use App\Domain\Pallets\PalletLabelZpl;
+use App\Domain\BoxLabels\LabelFormatConfig;
 use App\Domain\Shared\Origin;
 use App\Domain\Shared\TraceContext;
 use App\Enums\Permission;
@@ -21,6 +23,7 @@ use App\Models\PalletCloseReason;
 use App\Models\PalletStandard;
 use App\Models\PalletScanEvent;
 use App\Models\TraceEvent;
+use App\Services\ZebraPrintService;
 use App\Support\Correlation\CorrelationId;
 use Flux\Flux;
 use Illuminate\Database\Eloquent\Collection;
@@ -41,6 +44,37 @@ new #[Title('Producción')] class extends Component {
     public function boot(): void
     {
         abort_unless(Auth::user()?->can(Permission::PalletsOperate->value), 403);
+    }
+
+    public string $printerIp = '192.168.1.155';
+
+    public int $printerPort = 9100;
+
+    public int $printSpeed = 6;
+
+    public ?array $printerStatus = null;
+
+    public function mount(): void
+    {
+        $this->printerIp = (string) config('services.zebra.ip', env('ZEBRA_PRINTER_IP', '192.168.1.155'));
+        $this->printerPort = (int) config('services.zebra.port', env('ZEBRA_PRINTER_PORT', 9100));
+        $this->printSpeed = LabelFormatConfig::printSpeed();
+        $this->checkPrinter();
+    }
+
+    public function setZebraSpeed(int $speed): void
+    {
+        $speed = max(2, min(14, $speed));
+        LabelFormatConfig::setPrintSpeed($speed);
+        $this->printSpeed = $speed;
+        Flux::modal('zebra-speed-modal')->close();
+        Flux::toast(variant: 'success', text: "Velocidad de impresión ajustada a {$speed} ips.");
+    }
+
+    public function checkPrinter(): void
+    {
+        $zebra = app(ZebraPrintService::class);
+        $this->printerStatus = $zebra->getPrinterStatus($this->printerIp, $this->printerPort);
     }
 
     #[Locked]
@@ -80,6 +114,32 @@ new #[Title('Producción')] class extends Component {
     #[Locked]
     public ?string $boxError = null;
 
+
+    public bool $showDatalogicDebug = true;
+
+    public function clearDatalogicDebug(): void
+    {
+        app(\App\Services\DatalogicDebugService::class)->clear();
+        Flux::toast(variant: 'success', text: 'Historial de depuración de Datalogic limpiado.');
+    }
+
+    /**
+     * @return list<array<string, mixed>>
+     */
+    #[Computed]
+    public function datalogicDebug(): array
+    {
+        return app(\App\Services\DatalogicDebugService::class)->getRecent(20);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    #[Computed]
+    public function datalogicStats(): array
+    {
+        return app(\App\Services\DatalogicDebugService::class)->getStats();
+    }
 
     private function context(): TraceContext
     {
@@ -154,7 +214,7 @@ new #[Title('Producción')] class extends Component {
         if ($counted !== null && ($error === null || $counted->received_at->greaterThanOrEqualTo($error->occurred_at))) {
             $last = [
                 'ok' => true, 'at' => $counted->received_at, 'reader' => (string) ($codes[$counted->read_by_device_id] ?? ''),
-                'box' => $counted->external_event_id, 'pallet' => $counted->pallet?->pallet_code,
+                'box' => $counted->box_code_display, 'pallet' => $counted->pallet?->pallet_code,
                 'boxes' => $counted->pallet?->boxes_count, 'standard' => $counted->pallet?->standard_boxes_snapshot,
                 'order' => $counted->production_order_ref, 'lot' => $counted->lot_code, 'reason' => null, 'read' => null,
             ];
@@ -168,7 +228,7 @@ new #[Title('Producción')] class extends Component {
 
         // Every read of the line, newest first, so none goes by unseen on a fast line.
         $recent = collect()
-            ->concat($countedReads->map(fn (PalletScanEvent $e) => ['ok' => true, 'at' => $e->received_at, 'reader' => (string) ($codes[$e->read_by_device_id] ?? ''), 'text' => $e->external_event_id.' → '.($e->pallet?->pallet_code ?? '')]))
+            ->concat($countedReads->map(fn (PalletScanEvent $e) => ['ok' => true, 'at' => $e->received_at, 'reader' => (string) ($codes[$e->read_by_device_id] ?? ''), 'text' => $e->box_code_display.' → '.($e->pallet?->pallet_code ?? '')]))
             ->concat($errors->map(fn (TraceEvent $e) => ['ok' => false, 'at' => $e->occurred_at, 'reader' => (string) ($codes[$e->subject_id] ?? ''), 'text' => (string) $e->reason]))
             ->sortByDesc(fn (array $r) => $r['at']->getTimestamp() + $r['at']->micro / 1e6)
             ->take(10)->values()->all();
@@ -299,10 +359,11 @@ new #[Title('Producción')] class extends Component {
         $this->validate(['reprintReason' => ['required', 'string', 'max:300']], attributes: ['reprintReason' => 'motivo']);
 
         $this->print($print, (int) $this->reprintingId, $this->reprintReason);
+        Flux::modal('reprint-label')->close();
     }
 
     /**
-     * Records the print, then opens the printable label.
+     * Records the print, generates vertical ZPL and transmits directly to the Zebra printer.
      */
     private function print(PrintLabel $print, int $palletId, ?string $reason): void
     {
@@ -310,11 +371,23 @@ new #[Title('Producción')] class extends Component {
         $this->run(function () use ($palletId, $print, $reason, &$printed): string {
             $printed = $print->handle(Auth::user(), $palletId, $reason, $this->context());
 
-            return 'Etiqueta generada.';
+            return 'Etiqueta registrada.';
         });
 
         if ($printed !== null) {
-            $this->redirectRoute('pallets.label', ['pallet' => $palletId, 'print' => $printed->print_number]);
+            $pallet = Pallet::query()->with('item:id,description')->find($palletId);
+            if ($pallet) {
+                $zpl = PalletLabelZpl::render($pallet, $printed);
+                $zebra = app(ZebraPrintService::class);
+                $result = $zebra->printToSocket($this->printerIp, $this->printerPort, $zpl);
+
+                if ($result['success']) {
+                    Flux::toast(variant: 'success', text: "Etiqueta de estiba {$pallet->pallet_code} impresa en Zebra ({$this->printerIp}).");
+                } else {
+                    Flux::toast(variant: 'warning', text: "Etiqueta registrada pero falló el envío a Zebra: {$result['message']}");
+                }
+                $this->checkPrinter();
+            }
         }
     }
 
@@ -380,9 +453,37 @@ new #[Title('Producción')] class extends Component {
             <flux:heading size="xl" level="1">Producción</flux:heading>
             <flux:subheading>Estibas en proceso y por despachar a paletizado</flux:subheading>
         </div>
-        @if (! config('traceability.decisions.scan_ingestion_enabled'))
-            <flux:badge color="amber" icon="exclamation-triangle" size="lg">Sensor automático apagado (DP-01): usa la lectura manual</flux:badge>
-        @endif
+
+        <div class="flex flex-wrap items-center gap-3">
+            {{-- Estado en tiempo real de la Zebra y control de velocidad --}}
+            <div class="flex items-center gap-2 rounded-lg border border-zinc-200 bg-white px-3 py-1.5 shadow-sm dark:border-zinc-700 dark:bg-zinc-800">
+                @if ($printerStatus && ($printerStatus['online'] ?? false))
+                    <span class="inline-block h-2.5 w-2.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                    <span class="text-xs font-medium text-zinc-700 dark:text-zinc-200">
+                        Zebra ZT411 ({{ $printerIp }}): <strong class="text-emerald-600 dark:text-emerald-400">{{ $printerStatus['status_label'] }}</strong>
+                    </span>
+                @else
+                    <span class="inline-block h-2.5 w-2.5 rounded-full bg-rose-500"></span>
+                    <span class="text-xs font-medium text-zinc-700 dark:text-zinc-200">
+                        Zebra ({{ $printerIp }}): <strong class="text-rose-600 dark:text-rose-400">{{ $printerStatus['status_label'] ?? 'Sin conexión' }}</strong>
+                    </span>
+                @endif
+
+                <flux:modal.trigger name="zebra-speed-modal">
+                    <flux:button size="xs" variant="filled" icon="adjustments-horizontal" title="Ajustar velocidad de impresión">
+                        Velocidad: {{ $printSpeed }} ips
+                    </flux:button>
+                </flux:modal.trigger>
+
+                <flux:button size="xs" variant="ghost" icon="arrow-path" wire:click="checkPrinter" wire:loading.attr="disabled" wire:target="checkPrinter">
+                    Verificar
+                </flux:button>
+            </div>
+
+            @if (! config('traceability.decisions.scan_ingestion_enabled'))
+                <flux:badge color="amber" icon="exclamation-triangle" size="lg">Sensor automático apagado (DP-01): usa la lectura manual</flux:badge>
+            @endif
+        </div>
     </div>
 
     @can('pallets.operate')
@@ -521,6 +622,114 @@ new #[Title('Producción')] class extends Component {
                     </ul>
                 </div>
             @endif
+
+            {{-- Panel de Depuración en Vivo Datalogic (Eventos, TCP e Integración) --}}
+            <div class="mt-4 rounded-xl border border-zinc-200 bg-zinc-50/70 p-4 dark:border-zinc-700/80 dark:bg-zinc-900/40">
+                <div class="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-zinc-200 dark:border-zinc-700">
+                    <div class="flex items-center gap-2">
+                        <div class="rounded-lg bg-indigo-100 p-1.5 text-indigo-700 dark:bg-indigo-950/70 dark:text-indigo-400">
+                            <flux:icon icon="cpu-chip" class="size-5" />
+                        </div>
+                        <div>
+                            <div class="font-bold text-sm text-zinc-900 dark:text-white flex items-center gap-2">
+                                <span>Depuración en Vivo Datalogic</span>
+                                <span class="text-xs font-mono font-normal text-zinc-500">(TCP: 192.168.1.200:51236)</span>
+                            </div>
+                            <div class="text-xs text-zinc-500 dark:text-zinc-400">
+                                Diagnóstico detallado: llamadas internas/externas, sockets TCP y motivos de rechazo
+                            </div>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        @php($dbgStats = $this->datalogicStats)
+                        <div class="hidden sm:flex items-center gap-1.5 text-xs">
+                            <span class="rounded bg-zinc-200 px-1.5 py-0.5 font-mono dark:bg-zinc-800">{{ $dbgStats['total_reads'] ?? 0 }} leídos</span>
+                            <span class="rounded bg-emerald-100 px-1.5 py-0.5 font-mono text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">{{ $dbgStats['total_counted'] ?? 0 }} contadas</span>
+                            <span class="rounded bg-amber-100 px-1.5 py-0.5 font-mono text-amber-800 dark:bg-amber-950 dark:text-amber-300">{{ $dbgStats['total_duplicate'] ?? 0 }} repetidas</span>
+                            <span class="rounded bg-red-100 px-1.5 py-0.5 font-mono text-red-800 dark:bg-red-950 dark:text-red-300">{{ $dbgStats['total_rejected'] ?? 0 }} descartadas</span>
+                        </div>
+                        <flux:button size="xs" variant="ghost" wire:click="clearDatalogicDebug" title="Limpiar historial de depuración">Limpiar</flux:button>
+                        <flux:button size="xs" variant="filled" wire:click="$toggle('showDatalogicDebug')">
+                            {{ $showDatalogicDebug ? 'Minimizar' : 'Expandir' }}
+                        </flux:button>
+                    </div>
+                </div>
+
+                @if ($showDatalogicDebug)
+                    @php($dbgEvents = $this->datalogicDebug)
+                    <div class="mt-3 space-y-3 max-h-[600px] overflow-y-auto pr-1">
+                        @if (empty($dbgEvents))
+                            <div class="rounded-lg border border-dashed border-zinc-300 p-4 text-center text-xs text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+                                Esperando lecturas del escáner Datalogic en la línea. Cada paquete TCP y evento de análisis aparecerá aquí en vivo.
+                            </div>
+                        @else
+                            @foreach ($dbgEvents as $event)
+                                <div wire:key="dbg-{{ $event['id'] }}" class="rounded-lg border text-xs p-3 transition-all {{ match($event['outcome']) {
+                                    'counted' => 'border-emerald-300 bg-white dark:border-emerald-800/60 dark:bg-zinc-900',
+                                    'duplicate' => 'border-amber-300 bg-white dark:border-amber-800/60 dark:bg-zinc-900',
+                                    default => 'border-red-300 bg-white dark:border-red-800/60 dark:bg-zinc-900',
+                                } }}">
+                                    {{-- Encabezado del evento --}}
+                                    <div class="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-zinc-100 dark:border-zinc-800">
+                                        <div class="flex items-center gap-2">
+                                            <span class="font-mono text-zinc-500 dark:text-zinc-400 font-semibold">{{ $event['time'] }}</span>
+                                            @if ($event['outcome'] === 'counted')
+                                                <span class="rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-bold text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">✓ CONTADA A ESTIBA</span>
+                                            @elseif ($event['outcome'] === 'duplicate')
+                                                <span class="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-bold text-amber-800 dark:bg-amber-950 dark:text-amber-300">⚠ CAJA REPETIDA</span>
+                                            @else
+                                                <span class="rounded-full bg-red-100 px-2 py-0.5 text-[11px] font-bold text-red-800 dark:bg-red-950 dark:text-red-300">✗ NO CONTADA / DESCARTADA</span>
+                                            @endif
+                                            <span class="font-semibold text-zinc-800 dark:text-zinc-200">{{ $event['summary'] }}</span>
+                                        </div>
+                                        <div class="font-mono text-[11px] text-zinc-400">
+                                            {{ $event['raw_bytes_len'] }} bytes TCP
+                                        </div>
+                                    </div>
+
+                                    {{-- Entrada TCP RAW --}}
+                                    <div class="mt-2 rounded bg-zinc-950 px-2.5 py-1.5 font-mono text-[11px] text-zinc-300 flex items-center justify-between gap-2 overflow-x-auto">
+                                        <div class="flex items-center gap-1.5">
+                                            <span class="text-indigo-400 font-bold">TCP IN &gt;</span>
+                                            <span class="text-emerald-400">"{{ $event['raw_printable'] }}"</span>
+                                        </div>
+                                        <span class="text-[10px] text-zinc-500 shrink-0">Hex: {{ Str::limit($event['raw_hex'], 24) }}</span>
+                                    </div>
+
+                                    {{-- Acciones ejecutadas vs Omitidas --}}
+                                    <div class="mt-2.5 grid gap-3 sm:grid-cols-2">
+                                        {{-- Acciones que SÍ se realizaron --}}
+                                        <div class="rounded border border-emerald-100 bg-emerald-50/50 p-2 dark:border-emerald-900/40 dark:bg-emerald-950/20">
+                                            <div class="font-bold text-[11px] text-emerald-800 dark:text-emerald-300 flex items-center gap-1 mb-1">
+                                                <flux:icon icon="check" class="size-3.5 text-emerald-600" />
+                                                <span>Acciones Realizadas en el Sistema:</span>
+                                            </div>
+                                            <ul class="space-y-0.5 text-[11px] text-zinc-700 dark:text-zinc-300 list-disc list-inside">
+                                                @foreach ($event['actions_done'] as $action)
+                                                    <li>{{ $action }}</li>
+                                                @endforeach
+                                            </ul>
+                                        </div>
+
+                                        {{-- Acciones que NO se realizaron y por qué --}}
+                                        <div class="rounded border border-zinc-200 bg-zinc-100/60 p-2 dark:border-zinc-800 dark:bg-zinc-800/40">
+                                            <div class="font-bold text-[11px] text-zinc-700 dark:text-zinc-300 flex items-center gap-1 mb-1">
+                                                <flux:icon icon="no-symbol" class="size-3.5 text-amber-500" />
+                                                <span>Acciones NO Realizadas (y motivo):</span>
+                                            </div>
+                                            <ul class="space-y-0.5 text-[11px] text-zinc-600 dark:text-zinc-400 list-disc list-inside">
+                                                @foreach ($event['actions_not_done'] as $action)
+                                                    <li>{{ $action }}</li>
+                                                @endforeach
+                                            </ul>
+                                        </div>
+                                    </div>
+                                </div>
+                            @endforeach
+                        @endif
+                    </div>
+                @endif
+            </div>
         </div>
     @endif
 
@@ -693,5 +902,68 @@ new #[Title('Producción')] class extends Component {
                 <flux:button type="submit" variant="primary" wire:loading.attr="disabled" wire:target="confirmLabel">Confirmar</flux:button>
             </div>
         </form>
+    </flux:modal>
+
+    {{-- Modal para regular la velocidad de la impresora Zebra (Flux) --}}
+    <flux:modal name="zebra-speed-modal" class="w-full max-w-md">
+        <div class="flex flex-col gap-4">
+            <div class="flex items-start gap-3">
+                <div class="rounded-full bg-indigo-100 p-2 text-indigo-600 dark:bg-indigo-950/60 dark:text-indigo-400">
+                    <flux:icon icon="bolt" class="size-6" />
+                </div>
+                <div>
+                    <flux:heading size="lg">Velocidad de impresión Zebra</flux:heading>
+                    <flux:subheading>
+                        Regula la velocidad en pulgadas por segundo (IPS) para la Zebra ZT411 ({{ $printerIp }}). El cambio se guarda inmediatamente.
+                    </flux:subheading>
+                </div>
+            </div>
+
+            <div class="rounded-lg border border-zinc-200 bg-zinc-50 p-4 text-sm space-y-3 dark:border-zinc-700 dark:bg-zinc-800/60">
+                <div class="flex items-center justify-between">
+                    <span class="text-zinc-700 dark:text-zinc-200 font-medium">Velocidad activa:</span>
+                    <flux:badge color="indigo" size="lg" class="font-bold">{{ $printSpeed }} ips (~{{ round($printSpeed * 25.4) }} mm/s)</flux:badge>
+                </div>
+
+                <div class="text-xs text-zinc-500">Selecciona una velocidad rápida predefinida:</div>
+
+                <div class="grid grid-cols-2 gap-2">
+                    @foreach ([
+                        3 => ['label' => '3 IPS', 'desc' => 'Muy lenta (~76 mm/s)'],
+                        4 => ['label' => '4 IPS', 'desc' => 'Moderada (~102 mm/s)'],
+                        6 => ['label' => '6 IPS', 'desc' => 'Recomendada (~152 mm/s)'],
+                        8 => ['label' => '8 IPS', 'desc' => 'Rápida (~203 mm/s)'],
+                        10 => ['label' => '10 IPS', 'desc' => 'Muy rápida (~254 mm/s)'],
+                        12 => ['label' => '12 IPS', 'desc' => 'Máxima (~305 mm/s)'],
+                    ] as $spd => $info)
+                        <button type="button" wire:click="setZebraSpeed({{ $spd }})"
+                            class="flex flex-col items-start p-2.5 rounded-lg border text-left transition-all {{ $printSpeed === $spd ? 'border-indigo-600 bg-indigo-50 dark:border-indigo-400 dark:bg-indigo-950/40 text-indigo-900 dark:text-indigo-200 ring-2 ring-indigo-500/30' : 'border-zinc-200 bg-white hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:bg-zinc-800 text-zinc-800 dark:text-zinc-200' }}">
+                            <div class="flex items-center justify-between w-full">
+                                <span class="font-bold text-sm">{{ $info['label'] }}</span>
+                                @if ($printSpeed === $spd)
+                                    <flux:icon icon="check" class="size-4 text-indigo-600 dark:text-indigo-400" />
+                                @endif
+                            </div>
+                            <span class="text-[11px] text-zinc-500 dark:text-zinc-400 leading-tight mt-0.5">{{ $info['desc'] }}</span>
+                        </button>
+                    @endforeach
+                </div>
+
+                <div class="pt-2 border-t border-zinc-200 dark:border-zinc-700">
+                    <div class="flex items-end gap-2">
+                        <div class="flex-1">
+                            <flux:input wire:model="printSpeed" type="number" min="2" max="14" label="O ingresa un valor exacto (2 a 14 IPS)" />
+                        </div>
+                        <flux:button type="button" variant="primary" wire:click="setZebraSpeed($wire.printSpeed)">Guardar</flux:button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="flex justify-end gap-2">
+                <flux:modal.close>
+                    <flux:button variant="ghost">Cerrar</flux:button>
+                </flux:modal.close>
+            </div>
+        </div>
     </flux:modal>
 </section>

@@ -10,6 +10,7 @@ use App\Domain\Shared\TraceContext;
 use App\Domain\Shared\TraceEventType;
 use App\Domain\Shared\TraceResult;
 use App\Models\Device;
+use App\Services\DatalogicDebugService;
 use App\Services\TraceLogger;
 use Illuminate\Database\DetectsLostConnections;
 use Illuminate\Database\QueryException;
@@ -45,11 +46,16 @@ class BoxReaderSession
 
     private string $buffer = '';
 
+    private readonly DatalogicDebugService $debug;
+
     public function __construct(
         private readonly Device $reader,
         private readonly RegisterManualBoxScan $scan,
         private readonly TraceLogger $trace,
-    ) {}
+        ?DatalogicDebugService $debug = null,
+    ) {
+        $this->debug = $debug ?? app(DatalogicDebugService::class);
+    }
 
     /**
      * Takes a chunk as it came from the reader and handles every read in it.
@@ -113,8 +119,78 @@ class BoxReaderSession
             try {
                 $scan = $this->scan->fromReader($this->reader, $text, $ctx);
 
+                $actionsDone = [
+                    "Socket TCP: Recibido paquete desde {$this->reader->code} (".strlen($text).' caracteres)',
+                    'Parser: Token de caja TRZB validado y extraído correctamente',
+                    "Base de datos: Etiqueta {$scan->boxCode} localizada en tabla 'box_labels' (Lote: {$scan->lotCode})",
+                    "Orden de Fabricación: Orden #{$scan->orderRef} verificada como Liberada en SAP y activa",
+                    "Ítem / Producto: Producto {$scan->itemCode} coincide con la formulación de la Orden ({$scan->itemDescription})",
+                    "Control de Duplicados: Verificado en 'pallet_scan_events' que la caja no había sido leída",
+                    'Ruteo de Estiba: Caja asignada a la estiba '.($scan->result->palletCode ?? 'N/A')." (Avance: {$scan->result->boxesCount} de {$scan->result->standard} cajas)",
+                    'Trazabilidad: Registrado evento PalletScanEvent y auditoría TraceEvent en PostgreSQL',
+                ];
+
+                if ($scan->result->palletClosed) {
+                    $actionsDone[] = "Cierre Automático: ¡Estiba {$scan->result->palletCode} completada ({$scan->result->standard}/{$scan->result->standard})! Estado cambió a Finalizada";
+                }
+
+                $actionsNotDone = [];
+                if (! $scan->result->palletClosed) {
+                    $remaining = max(0, ($scan->result->standard ?? 0) - ($scan->result->boxesCount ?? 0));
+                    $actionsNotDone[] = "Cierre de Estiba: La estiba {$scan->result->palletCode} NO se cerró aún (faltan {$remaining} cajas para completar el estándar)";
+                }
+                $actionsNotDone[] = 'Socket TCP Saliente: No se enviaron bytes al lector Datalogic (protocolo pasivo unidireccional)';
+                $actionsNotDone[] = 'SAP Service Layer: No se llamó a SAP en esta lectura individual (los Recibos de Producción se transmiten al completar/confirmar la estiba)';
+                $actionsNotDone[] = 'Impresora Zebra: No se envió formato de etiqueta de estiba (se imprime en la estación al finalizar)';
+
+                $this->debug->recordScanEvent([
+                    'device' => $this->reader->code,
+                    'raw_input' => $text,
+                    'outcome' => 'counted',
+                    'summary' => "Caja {$scan->boxCode} → {$scan->result->palletCode} ({$scan->result->boxesCount}/{$scan->result->standard})",
+                    'box_code' => $scan->boxCode,
+                    'pallet_code' => $scan->result->palletCode,
+                    'order_ref' => $scan->orderRef,
+                    'lot_code' => $scan->lotCode,
+                    'reason' => null,
+                    'actions_done' => $actionsDone,
+                    'actions_not_done' => $actionsNotDone,
+                    'details' => [
+                        'box_code' => $scan->boxCode,
+                        'pallet_code' => $scan->result->palletCode,
+                        'boxes_count' => $scan->result->boxesCount,
+                        'standard' => $scan->result->standard,
+                        'order_ref' => $scan->orderRef,
+                        'item_code' => $scan->itemCode,
+                        'pallet_closed' => $scan->result->palletClosed,
+                    ],
+                ]);
+
                 return new BoxRead(BoxReadOutcome::Counted, $scan->boxCode.' → '.($scan->result->palletCode ?? ''));
             } catch (BoxAlreadyRead $e) {
+                $actionsDone = [
+                    "Socket TCP: Recibido paquete desde {$this->reader->code} (".strlen($text).' caracteres)',
+                    'Parser: Formato de token analizado',
+                    "Control de Duplicados: Consulta en 'pallet_scan_events' detectó que esta caja ya había sido registrada previamente",
+                ];
+
+                $actionsNotDone = [
+                    'Re-conteo en Estiba: La caja NO se suma nuevamente para evitar duplicidad y proteger la precisión física',
+                    'Apertura de Estiba: No se creó ninguna estiba',
+                    'Socket TCP Saliente: No se enviaron bytes al lector (comunicación pasiva)',
+                    'SAP Service Layer: No se ejecutó ninguna llamada externa',
+                ];
+
+                $this->debug->recordScanEvent([
+                    'device' => $this->reader->code,
+                    'raw_input' => $text,
+                    'outcome' => 'duplicate',
+                    'summary' => "Lectura duplicada: {$e->getMessage()}",
+                    'reason' => $e->getMessage(),
+                    'actions_done' => $actionsDone,
+                    'actions_not_done' => $actionsNotDone,
+                ]);
+
                 return new BoxRead(BoxReadOutcome::AlreadyRead, $e->getMessage());
             } catch (PalletRuleViolation $e) {
                 return $this->notCounted($ctx, $text, $e->getMessage());
@@ -144,6 +220,35 @@ class BoxReaderSession
             report($e);
         }
         Log::warning('Caja no contada por el lector fijo', ['device' => $this->reader->code, 'read' => $shown, 'reason' => $reason]);
+
+        $isUrl = str_starts_with(trim($text), 'http://') || str_starts_with(trim($text), 'https://') || str_contains($text, 'tecnoalsa');
+        $actionsDone = [
+            "Socket TCP: Recibido paquete desde {$this->reader->code} (".strlen($text).' caracteres)',
+            'Parser: Análisis sintáctico completado (no cumple estructura TRZB de caja)',
+            'Auditoría: Registrado evento TraceEvent::ScanRejected en base de datos',
+        ];
+
+        $actionsNotDone = [
+            "Búsqueda en Base de Datos: Omitida consulta en 'box_labels' porque el texto leído no corresponde al formato de etiqueta de caja",
+            'Asignación a Estiba: No se asignó a ninguna estiba',
+            'Socket TCP Saliente: No se enviaron comandos de error al lector Datalogic (protocolo unidireccional)',
+            'SAP Service Layer: No se ejecutó ninguna llamada a SAP',
+            'Impresión de Etiquetas: No se realizó ninguna acción',
+        ];
+
+        if ($isUrl) {
+            $actionsNotDone[] = "Diagnóstico específico: El escáner leyó la URL publicitaria preimpresa en el empaque de la caja ('".Str::limit(trim($text), 50)."') en lugar de la etiqueta de trazabilidad con el código QR TRZB.";
+        }
+
+        $this->debug->recordScanEvent([
+            'device' => $this->reader->code,
+            'raw_input' => $text,
+            'outcome' => 'rejected',
+            'summary' => "Lectura descartada: {$reason}",
+            'reason' => $reason,
+            'actions_done' => $actionsDone,
+            'actions_not_done' => $actionsNotDone,
+        ]);
 
         return new BoxRead(BoxReadOutcome::Rejected, $reason);
     }

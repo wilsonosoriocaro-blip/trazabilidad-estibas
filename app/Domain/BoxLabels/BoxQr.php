@@ -24,13 +24,13 @@ final class BoxQr
 
     /**
      * The token inside a scanned value, or null when it is not a box QR.
-     * Tolerates what keyboard-like readers do: spaces or a line break around
-     * it, the ":" typed as another symbol on a different keyboard layout,
-     * capitals with caps lock on.
+     * Tolerates what keyboard-like readers do: spaces or line breaks,
+     * separators, capitals, or trailing suffixes/box numbers (e.g. 001-02).
+     * Extracts strictly the 32-hexadecimal token of the label.
      */
     public static function tokenFrom(string $scanned): ?string
     {
-        if (preg_match('/^\s*TRZB\X([0-9a-f]{32})\s*$/iu', $scanned, $m) !== 1) {
+        if (preg_match('/TRZB.{1,4}?([0-9a-f]{32})/i', $scanned, $m) !== 1) {
             return null;
         }
 

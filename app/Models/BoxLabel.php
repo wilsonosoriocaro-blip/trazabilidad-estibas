@@ -27,7 +27,7 @@ class BoxLabel extends Model
      */
     protected function casts(): array
     {
-        return ['created_at' => 'immutable_datetime', 'sequence' => 'integer'];
+        return ['created_at' => 'immutable_datetime', 'sequence' => 'integer', 'run_number' => 'integer'];
     }
 
     /**
