@@ -195,36 +195,71 @@ new #[Title('Tablero de OF')] class extends Component {
         </flux:callout>
     @endif
 
-    {{-- KPIs --}}
-    <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
-        <div class="rounded-xl border border-zinc-200 p-5 dark:border-zinc-700">
-            <div class="text-sm text-zinc-500 dark:text-zinc-400">OF liberadas</div>
-            <div class="mt-1 text-4xl font-semibold tabular-nums">{{ $kpis['orders'] }}</div>
-            <div class="mt-2 text-xs text-zinc-500">{{ $kpis['no_progress'] }} sin avance</div>
-        </div>
-        @foreach ($kpis['units'] as $uom => $u)
-            <div class="rounded-xl border border-zinc-200 p-5 dark:border-zinc-700">
-                <div class="text-sm text-zinc-500 dark:text-zinc-400">Recibido en 04</div>
-                <div class="mt-1 text-4xl font-semibold tabular-nums">{{ $pct($u['received'], $u['planned']) }}%</div>
-                <div class="mt-2 h-2 overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-700"><div class="h-full rounded-full bg-blue-500" style="width: {{ $pct($u['received'], $u['planned']) }}%"></div></div>
-                <div class="mt-2 text-xs text-zinc-500 tabular-nums">{{ Quantities::format($u['received']) }} de {{ Quantities::format($u['planned']) }} {{ $uom }}</div>
+    {{-- KPIs: one overall picture in boxes (they add up across products and units), and the orders that need attention. --}}
+    @php
+        $b = $kpis['boxes'];
+    @endphp
+    <div class="grid gap-4 lg:grid-cols-3" data-of-kpis>
+        {{-- Orders --}}
+        <div class="rounded-2xl border border-zinc-200 p-5 dark:border-zinc-700">
+            <div class="flex items-center gap-2 text-sm font-medium text-zinc-500 dark:text-zinc-400"><flux:icon.clipboard-document-list variant="mini" /> OF liberadas</div>
+            <div class="mt-1 text-5xl font-bold tabular-nums text-zinc-900 dark:text-white">{{ $kpis['orders'] }}</div>
+            @php
+                $segments = [['En lectura', $kpis['reading'], 'bg-amber-500'], ['Sin lectura', max(0, $kpis['orders'] - $kpis['reading']), 'bg-zinc-300 dark:bg-zinc-600']];
+            @endphp
+            <div class="mt-3 flex h-3 overflow-hidden rounded-full bg-zinc-100 dark:bg-zinc-800" role="img" aria-label="{{ $kpis['reading'] }} OF con cajas leídas de {{ $kpis['orders'] }}">
+                @foreach ($segments as [$label, $n, $color])
+                    @if ($n > 0)<div class="h-full {{ $color }}" style="width: {{ $pct($n, max(1, $kpis['orders'])) }}%"></div>@endif
+                @endforeach
             </div>
-            <div class="rounded-xl border border-zinc-200 p-5 dark:border-zinc-700">
-                <div class="text-sm text-zinc-500 dark:text-zinc-400">Transferido a CEDI</div>
-                <div class="mt-1 text-4xl font-semibold tabular-nums">{{ $pct($u['transferred'], $u['planned']) }}%</div>
-                <div class="mt-2 h-2 overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-700"><div class="h-full rounded-full bg-violet-500" style="width: {{ $pct($u['transferred'], $u['planned']) }}%"></div></div>
-                <div class="mt-2 text-xs text-zinc-500 tabular-nums">{{ Quantities::format($u['transferred']) }} de {{ Quantities::format($u['planned']) }} {{ $uom }}</div>
+            <div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-sm">
+                <span class="flex items-center gap-1.5"><span class="size-2.5 rounded-full bg-amber-500"></span><strong class="tabular-nums">{{ $kpis['reading'] }}</strong> con cajas leídas</span>
+                <span class="flex items-center gap-1.5"><span class="size-2.5 rounded-full bg-zinc-300 dark:bg-zinc-600"></span><strong class="tabular-nums">{{ max(0, $kpis['orders'] - $kpis['reading']) }}</strong> sin lectura</span>
             </div>
-        @endforeach
-        <div @class(['rounded-xl border p-5', 'border-green-400 bg-green-50 dark:border-green-700 dark:bg-green-950' => $kpis['ready'] + $kpis['over'] > 0, 'border-zinc-200 dark:border-zinc-700' => $kpis['ready'] + $kpis['over'] === 0])>
-            <div class="text-sm text-zinc-500 dark:text-zinc-400">Listas para cerrar en SAP</div>
-            <div class="mt-1 text-4xl font-semibold tabular-nums">{{ $kpis['ready'] + $kpis['over'] }}</div>
-            <div class="mt-2 text-xs text-zinc-500">{{ $kpis['in_cedi'] }} ya completas en CEDI @if ($kpis['over'] > 0)· <span class="text-red-600">{{ $kpis['over'] }} con sobreproducción</span>@endif</div>
         </div>
-        <button type="button" wire:click="$set('stage', '{{ OrderStage::Closed->value }}')" class="rounded-xl border border-zinc-200 p-5 text-start hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-white/5">
-            <div class="text-sm text-zinc-500 dark:text-zinc-400">Cerradas en SAP</div>
-            <div class="mt-1 text-4xl font-semibold tabular-nums">{{ $kpis['closed'] }}</div>
-            <div class="mt-2 text-xs text-zinc-500">Pasaron por la aplicación y ya se cerraron en SAP</div>
+
+        {{-- Overall progress in boxes --}}
+        <div class="rounded-2xl border border-zinc-200 p-5 lg:col-span-2 dark:border-zinc-700">
+            <div class="flex flex-wrap items-baseline justify-between gap-2">
+                <div class="flex items-center gap-2 text-sm font-medium text-zinc-500 dark:text-zinc-400"><flux:icon.cube variant="mini" /> Avance en cajas de las OF liberadas</div>
+                <div class="text-xs text-zinc-500 tabular-nums">{{ number_format($b['planned'], 0, ',', '.') }} cajas planificadas</div>
+            </div>
+            <div class="mt-3 grid gap-4 sm:grid-cols-3">
+                @foreach ([['Leídas', $b['read'], 'bg-amber-500', 'text-amber-700 dark:text-amber-400'], ['Recibidas en 04', $b['received'], 'bg-blue-500', 'text-blue-700 dark:text-blue-400'], ['En CEDI', $b['transferred'], 'bg-violet-500', 'text-violet-700 dark:text-violet-400']] as [$label, $n, $bar, $text])
+                    <div>
+                        <div class="flex items-baseline justify-between">
+                            <span class="text-sm font-medium {{ $text }}">{{ $label }}</span>
+                            <span class="text-2xl font-bold tabular-nums text-zinc-900 dark:text-white">{{ $pct($n, $b['planned']) }}%</span>
+                        </div>
+                        <div class="mt-1 h-2.5 overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-700"><div class="h-full rounded-full {{ $bar }}" style="width: {{ $pct($n, $b['planned']) }}%"></div></div>
+                        <div class="mt-1 text-xs text-zinc-500 tabular-nums">{{ number_format($n, 0, ',', '.') }} cajas</div>
+                    </div>
+                @endforeach
+            </div>
+        </div>
+    </div>
+
+    {{-- What needs someone --}}
+    <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <button type="button" wire:click="$set('stage', '{{ OrderStage::ReadyToClose->value }}')" @class(['rounded-xl border-2 p-4 text-start transition hover:shadow-sm', 'border-emerald-500 bg-emerald-50 dark:bg-emerald-950' => $kpis['ready'] > 0, 'border-zinc-200 dark:border-zinc-700' => $kpis['ready'] === 0]) data-kpi="ready">
+            <div class="flex items-center gap-2 text-sm font-medium text-emerald-800 dark:text-emerald-300"><flux:icon.check-badge variant="mini" /> Listas para cerrar en SAP</div>
+            <div class="mt-1 text-3xl font-bold tabular-nums text-zinc-900 dark:text-white">{{ $kpis['ready'] }}</div>
+            <div class="text-xs text-zinc-500">{{ $kpis['in_cedi'] }} ya completas en CEDI</div>
+        </button>
+        <button type="button" wire:click="$set('stage', '{{ OrderStage::OverProduced->value }}')" @class(['rounded-xl border-2 p-4 text-start transition hover:shadow-sm', 'border-red-500 bg-red-50 dark:bg-red-950' => $kpis['over'] > 0, 'border-zinc-200 dark:border-zinc-700' => $kpis['over'] === 0]) data-kpi="over">
+            <div class="flex items-center gap-2 text-sm font-medium text-red-700 dark:text-red-300"><flux:icon.exclamation-triangle variant="mini" /> Sobreproducción</div>
+            <div class="mt-1 text-3xl font-bold tabular-nums text-zinc-900 dark:text-white">{{ $kpis['over'] }}</div>
+            <div class="text-xs text-zinc-500">recibido por encima de lo planificado</div>
+        </button>
+        <div @class(['rounded-xl border-2 p-4', 'border-amber-400 bg-amber-50 dark:border-amber-600 dark:bg-amber-950' => $kpis['pending_in_sap'] > 0, 'border-zinc-200 dark:border-zinc-700' => $kpis['pending_in_sap'] === 0]) data-kpi="pending">
+            <div class="flex items-center gap-2 text-sm font-medium text-amber-800 dark:text-amber-300"><flux:icon.clock variant="mini" /> Pendientes en SAP</div>
+            <div class="mt-1 text-3xl font-bold tabular-nums text-zinc-900 dark:text-white">{{ $kpis['pending_in_sap'] }}</div>
+            <div class="text-xs text-zinc-500">OF con documentos por conciliar</div>
+        </div>
+        <button type="button" wire:click="$set('stage', '{{ OrderStage::Closed->value }}')" class="rounded-xl border-2 border-zinc-200 p-4 text-start transition hover:shadow-sm dark:border-zinc-700" data-kpi="closed">
+            <div class="flex items-center gap-2 text-sm font-medium text-zinc-600 dark:text-zinc-300"><flux:icon.lock-closed variant="mini" /> Cerradas en SAP</div>
+            <div class="mt-1 text-3xl font-bold tabular-nums text-zinc-900 dark:text-white">{{ $kpis['closed'] }}</div>
+            <div class="text-xs text-zinc-500">pasaron por la aplicación</div>
         </button>
     </div>
 
