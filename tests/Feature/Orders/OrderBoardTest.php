@@ -314,7 +314,7 @@ class OrderBoardTest extends TestCase
 
         $this->actingAs($this->admin)->get(route('orders.index'))
             ->assertOk()
-            ->assertSeeInOrder(['OF liberadas', '4', 'Recibido en 04', 'Transferido a CEDI', 'Listas para cerrar en SAP'])
+            ->assertSeeInOrder(['OF liberadas', '4', 'con cajas leídas', 'Avance en cajas', 'Leídas', 'Recibidas en 04', 'En CEDI', 'Listas para cerrar en SAP', 'Sobreproducción', 'Pendientes en SAP', 'Cerradas en SAP'])
             ->assertSeeInOrder(['33134', 'Sobreproducción', '33128', 'Sin avance'])
             ->assertDontSee('66666');
 
@@ -323,6 +323,20 @@ class OrderBoardTest extends TestCase
             ->assertSee('GELATINA MERCALDAS')->assertDontSee('GELATINA OLIMPICA')
             ->set('stage', '')->set('search', 'olimpica')
             ->assertSee('GELATINA OLIMPICA')->assertDontSee('GELATINA MERCALDAS');
+    }
+
+    public function test_orders_whose_boxes_are_being_read_come_first(): void
+    {
+        $this->sync();
+        // 33131 has boxes read but nothing received yet; 33128 has nothing read.
+        Pallet::factory()->withBoxes(5)->create(['production_order_id' => $this->order('33131')->id]);
+
+        $refs = app(OrderBoardQuery::class)->rows()->map(fn (array $r) => $r['order']->ref)->values()->all();
+        $this->assertSame('33131', $refs[0]);
+        $this->assertGreaterThan(array_search('33131', $refs, true), array_search('33128', $refs, true));
+
+        $this->assertSame(1, app(OrderBoardQuery::class)->kpis()['reading']);
+        $this->assertSame(5, app(OrderBoardQuery::class)->kpis()['boxes']['read']);
     }
 
     private function closeInSap(string $ref): void

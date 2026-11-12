@@ -359,6 +359,14 @@ new #[Title('Etiquetas de caja')] class extends Component {
                     </dd>
                     <dt class="text-zinc-500">Etiquetas generadas</dt>
                     <dd class="font-medium tabular-nums">{{ $printed }}</dd>
+                    @if ($this->lot())
+                        @php($lastInLot = (int) BoxLabel::query()->where('production_order_id', $order->id)->where('lot_code', $this->lot())->max('sequence'))
+                        <dt class="text-zinc-500">Numeración de cajas</dt>
+                        <dd class="font-medium" data-next-box>
+                            Sigue en <span class="font-mono">#{{ str_pad((string) ($lastInLot + 1), 4, '0', STR_PAD_LEFT) }}</span>
+                            <span class="text-xs font-normal text-zinc-500">{{ $lastInLot === 0 ? '(lote '.$this->lot().' nuevo: empieza en 1)' : '(lote '.$this->lot().' llega hasta #'.str_pad((string) $lastInLot, 4, '0', STR_PAD_LEFT).')' }}</span>
+                        </dd>
+                    @endif
                     <dt class="text-zinc-500">Sugeridas por la OF</dt>
                     <dd class="font-medium tabular-nums">{{ $max ?? '—' }} <span class="text-xs font-normal text-zinc-500">(se puede generar más)</span></dd>
                 </dl>
@@ -511,13 +519,16 @@ new #[Title('Etiquetas de caja')] class extends Component {
 
         @if ($order->boxLabelBatches->isNotEmpty())
             @php($prints = BoxLabelPrint::query()->where('production_order_id', $order->id)->selectRaw('box_label_batch_id, count(*) as n')->groupBy('box_label_batch_id')->pluck('n', 'box_label_batch_id')->map(fn ($n) => (int) $n)->all())
+            {{-- Box numbers of each batch: they continue the lot's sequence across batches. --}}
+            @php($ranges = BoxLabel::query()->where('production_order_id', $order->id)->groupBy('box_label_batch_id')->selectRaw('box_label_batch_id, min(sequence) as first, max(sequence) as last')->get()->keyBy('box_label_batch_id'))
             <div>
                 <flux:heading size="lg" level="2" class="mb-1">Etiquetas generadas para esta orden</flux:heading>
-                <flux:text class="mb-3 text-sm">Cada tanda se imprime una sola vez. ¿Faltan cajas por etiquetar? Usa <strong>Generar etiquetas</strong>: el consecutivo sigue y cada caja recibe un QR nuevo.</flux:text>
+                <flux:text class="mb-3 text-sm">Cada tanda se imprime una sola vez. ¿Faltan cajas por etiquetar? Usa <strong>Generar etiquetas</strong>: con el mismo lote el consecutivo sigue (por ejemplo #0601 en adelante); un lote nuevo empieza en #0001. Cada caja recibe un QR nuevo.</flux:text>
                 <flux:table>
                     <flux:table.columns>
                         <flux:table.column>Generadas</flux:table.column>
                         <flux:table.column>Lote</flux:table.column>
+                        <flux:table.column>Rango de cajas</flux:table.column>
                         <flux:table.column>Vence</flux:table.column>
                         <flux:table.column align="end">Etiquetas</flux:table.column>
                         <flux:table.column>Por</flux:table.column>
@@ -529,6 +540,8 @@ new #[Title('Etiquetas de caja')] class extends Component {
                             <flux:table.row :key="$b->id">
                                 <flux:table.cell class="whitespace-nowrap text-xs tabular-nums">{{ $b->generated_at->timezone($tz)->format('d/m/Y H:i') }}</flux:table.cell>
                                 <flux:table.cell class="font-mono">{{ $b->lot_code }}</flux:table.cell>
+                                @php($range = $ranges->get($b->id))
+                                <flux:table.cell class="whitespace-nowrap font-mono text-sm" data-batch-range>{{ $range ? '#'.str_pad((string) $range->first, 4, '0', STR_PAD_LEFT).' – #'.str_pad((string) $range->last, 4, '0', STR_PAD_LEFT) : '—' }}</flux:table.cell>
                                 <flux:table.cell>{{ $b->expiration_date->format('d/m/Y') }}</flux:table.cell>
                                 <flux:table.cell align="end" class="tabular-nums">{{ $b->labels }}</flux:table.cell>
                                 <flux:table.cell>{{ $b->generator->name }}</flux:table.cell>

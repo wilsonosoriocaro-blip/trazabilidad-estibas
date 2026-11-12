@@ -248,6 +248,22 @@ class BoxLabelsTest extends TestCase
         $this->assertStringContainsString('^FDMA,'.BoxQr::payload((string) $tokens[24]).'^FS', $batch->zpl);
     }
 
+    public function test_the_page_shows_each_batch_range_and_where_the_numbering_continues(): void
+    {
+        $order = $this->ready();
+        $this->generate($order, 600);
+        $this->generate($order, 50);
+
+        Livewire::actingAs($this->operator)->test('pages::box-labels.index')
+            ->set('docNum', '33128')->call('consult')
+            ->set('productionDate', '2026-10-20')
+            ->assertSeeHtml('data-batch-range')
+            ->assertSee('#0001 – #0600')
+            ->assertSee('#0601 – #0650')
+            ->assertSee('Sigue en')
+            ->assertSee('#0651');
+    }
+
     public function test_the_label_shows_the_sales_units_of_the_item(): void
     {
         $order = $this->ready();
